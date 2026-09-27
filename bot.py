@@ -1,7 +1,5 @@
 """
-Smart Analyst — رأي المحلل فقط
-- كل ساعة: رأي المحلل لكل عملة
-- عند تغير مفاجئ: رأي فوري
+Smart Analyst — زبدة التحليل + إشعارات فورية
 """
 import os
 import threading
@@ -25,17 +23,17 @@ SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
            "XRP/USDT", "ADA/USDT", "AVAX/USDT", "DOGE/USDT"]
 
 HOURLY_MIN = 60
-ANOMALY_MIN = 10
+ALERT_MIN = 5  # فحص التغيرات كل 5 دقائق
 
 
 # ============================================================
 # Helpers
 # ============================================================
-def _num(n):
+def _num(n, digits=4):
     try:
         n = float(n)
         if n >= 1000: return f"{n:,.2f}"
-        if n >= 1: return f"{n:.4f}"
+        if n >= 1: return f"{n:.{digits}f}"
         return f"{n:.6f}"
     except Exception:
         return str(n)
@@ -51,146 +49,172 @@ def _emoji(state):
     return "⚪"
 
 
+def _confidence(snap) -> int:
+    """
+    يحسب نسبة الثقة بناءً على عدة عوامل:
+    - Score
+    - Regime
+    - انسجام العوامل
+    """
+    score = abs(snap.get("total_score", 0))
+    details = snap.get("details") or {}
+    regime = (details.get("regime") or {}).get("regime", "")
+    breakdown = [
+        snap.get("trend_score", 0),
+        snap.get("momentum_score", 0),
+        snap.get("volume_score", 0),
+        snap.get("orderflow_score", 0),
+        snap.get("structure_score", 0),
+        snap.get("context_score", 0),
+    ]
+
+    # الأساس: نسبة من الـ score
+    base = min(score * 3, 60)
+
+    # Regime bonus
+    regime_bonus = 0
+    if regime == "trending": regime_bonus = 20
+    elif regime == "ranging": regime_bonus = 5
+    elif regime == "low_vol": regime_bonus = 0
+    elif regime == "high_vol": regime_bonus = -10
+
+    # انسجام: عدد العوامل الموجبة
+    positive = sum(1 for b in breakdown if b > 2)
+    negative = sum(1 for b in breakdown if b < -2)
+    harmony = (positive - negative) * 5
+
+    confidence = base + regime_bonus + harmony
+    return max(0, min(100, int(confidence)))
+
+
 # ============================================================
-# رأي المحلل
+# زبدة التحليل
 # ============================================================
-def build_opinion(symbol: str) -> str | None:
+def build_essence(symbol: str) -> str | None:
+    """يبني زبدة التحليل — مختصر مفيد"""
     try:
-        snap_res = (
+        res = (
             supabase.table("snapshots").select("*")
             .eq("symbol", symbol)
             .order("timestamp", desc=True)
             .limit(1).execute()
         )
-        if not snap_res.data:
+        if not res.data:
             return None
-        snap = snap_res.data[0]
+        snap = res.data[0]
 
         state = snap.get("state", "NO TRADE")
         score = snap.get("total_score", 0)
         price = snap.get("price", 0)
         details = snap.get("details") or {}
-        regime = details.get("regime") or {}
+        regime = (details.get("regime") or {}).get("regime", "")
         levels = details.get("levels") or {}
         warnings = details.get("warnings") or []
-        breakdown = {
-            "trend": snap.get("trend_score", 0),
-            "momentum": snap.get("momentum_score", 0),
-            "volume": snap.get("volume_score", 0),
-            "orderflow": snap.get("orderflow_score", 0),
-            "structure": snap.get("structure_score", 0),
-            "context": snap.get("context_score", 0),
-            "risk": snap.get("risk_score", 0),
+
+        confidence = _confidence(snap)
+
+        # ===== القرار =====
+        if "STRONG BUY" in state:
+            decision = "🟢🔥 <b>ادخل الآن — قوي</b>"
+            decision_short = "🟢🔥 ادخل الآن"
+        elif state == "BUY SETUP":
+            decision = "🟢 <b>ادخل بحذر</b>"
+            decision_short = "🟢 ادخل بحذر"
+        elif state == "WAIT FOR CONFIRMATION":
+            decision = "🔵 <b>انتظر تأكيد</b>"
+            decision_short = "🔵 انتظر تأكيد"
+        elif state == "WATCH":
+            decision = "🟡 <b>راقب فقط</b>"
+            decision_short = "🟡 راقب فقط"
+        elif "STRONG SELL" in state:
+            decision = "🔴🔥 <b>اخرج — بيع حاد</b>"
+            decision_short = "🔴🔥 اخرج"
+        elif state == "SELL SETUP":
+            decision = "🔴 <b>بيع محتمل</b>"
+            decision_short = "🔴 بيع محتمل"
+        else:
+            decision = "⚪ <b>لا تداول</b>"
+            decision_short = "⚪ لا تداول"
+
+        # ===== السبب الرئيسي =====
+        bd = {
+            "الاتجاه": snap.get("trend_score", 0),
+            "الزخم": snap.get("momentum_score", 0),
+            "الحجم": snap.get("volume_score", 0),
+            "تدفق الأوامر": snap.get("orderflow_score", 0),
+            "البنية": snap.get("structure_score", 0),
+            "السياق": snap.get("context_score", 0),
         }
 
-        lines = []
-        lines.append(f"🧠 <b>رأي المحلل — {symbol}</b>")
-        lines.append(f"{_emoji(state)} <b>{state}</b>")
-        lines.append(f"💰 السعر: <b>{_num(price)}</b> | 📊 النقاط: <b>{score}</b>")
-        lines.append("")
-        lines.append("━━━━━━━━━━━━━━━━━━━")
-        lines.append("💬 <b>رأي المحلل</b>")
-        lines.append("")
+        positives = [k for k, v in bd.items() if v > 3]
+        negatives = [k for k, v in bd.items() if v < -2]
 
-        # ===== التقييم =====
-        if "STRONG BUY" in state:
-            lines.append("الوضع إيجابي بقوة. الأدلة مجتمعة تشير إلى فرصة شراء عالية الجودة.")
-        elif state == "BUY SETUP":
-            lines.append("الوضع إيجابي. توجد أدلة كافية لاعتبار هذه فرصة شراء محتملة.")
-        elif state == "WAIT FOR CONFIRMATION":
-            lines.append("الوضع مائل للإيجابية، لكن يحتاج تأكيداً. الإشارة قريبة لكن غير مكتملة.")
-        elif state == "WATCH":
-            lines.append("الوضع غير حاسم. توجد أدلة إيجابية جزئية، لكنها غير كافية للدخول.")
-        elif "STRONG SELL" in state:
-            lines.append("الوضع سلبي بقوة. الأدلة تشير إلى ضغط بيعي حاد.")
-        elif state == "SELL SETUP":
-            lines.append("الوضع سلبي. توجد أدلة كافية لاعتبار هذه فرصة بيع محتملة.")
+        # جملة السبب
+        if positives:
+            why = " + ".join(positives[:3]) + " إيجابي"
         else:
-            lines.append("الوضع محايد. لا توجد أدلة كافية لاتخاذ قرار.")
-        lines.append("")
+            why = "لا توجد عوامل قوية"
 
-        # ===== حالة السوق =====
-        rk = regime.get("regime")
-        if rk == "trending":
-            lines.append("📈 السوق في اتجاه واضح — الاتجاه صديقك.")
-        elif rk == "ranging":
-            lines.append("↔️ السوق جانبي — ركّز على الدعم والمقاومة.")
-        elif rk == "high_vol":
-            lines.append("🔥 التقلب مرتفع — قلل حجم الصفقة.")
-        elif rk == "low_vol":
-            lines.append("😴 التقلب منخفض — قد يجهّز السوق نفسه لاختراق.")
-        if rk:
-            lines.append("")
+        if negatives:
+            why += f" | {', '.join(negatives[:2])} سلبي"
 
-        # ===== أقوى/أضعف عامل =====
-        labels = {
-            "trend": "الاتجاه", "momentum": "الزخم", "volume": "الحجم",
-            "orderflow": "تدفق الأوامر", "structure": "البنية",
-            "context": "السياق", "risk": "المخاطرة",
-        }
-        strongest = max(breakdown.items(), key=lambda x: x[1])
-        weakest = min(breakdown.items(), key=lambda x: x[1])
-        if strongest[1] > 3:
-            lines.append(f"💪 أقوى عامل: {labels[strongest[0]]} (+{strongest[1]})")
-        if weakest[1] < -2:
-            lines.append(f"⚠️ أضعف عامل: {labels[weakest[0]]} ({weakest[1]})")
-        lines.append("")
-
-        # ===== النصيحة =====
-        if "STRONG BUY" in state:
-            lines.append("🎯 <b>النصيحة:</b> فرصة جيدة. ادخل داخل منطقة الدخول مع وقف دقيق.")
-        elif state == "BUY SETUP":
-            lines.append("🎯 <b>النصيحة:</b> ادخل جزئياً (50%) حتى تتأكد الإشارة.")
-        elif state == "WAIT FOR CONFIRMATION":
-            lines.append("🎯 <b>النصيحة:</b> انتظر شمعة تأكيد قبل التنفيذ.")
-        elif state == "WATCH":
-            lines.append("🎯 <b>النصيحة:</b> لا تدخل الآن. راقب وانتظر.")
-        elif "STRONG SELL" in state:
-            lines.append("🎯 <b>النصيحة:</b> اخرج من أي شراء. لا تشتر الآن.")
-        elif state == "SELL SETUP":
-            lines.append("🎯 <b>النصيحة:</b> البيع يحتاج تأكيداً إضافياً.")
-        else:
-            lines.append("🎯 <b>النصيحة:</b> لا تداول. الأفضل الانتظار.")
-        lines.append("")
-
-        # ===== تحذير =====
+        # ===== التحذيرات الحرجة =====
         critical = [w for w in warnings if "R:R" in w or "مقاومة" in w or "Order Flow" in w]
-        if critical:
-            lines.append("🚨 <b>تحذير:</b>")
-            for w in critical[:3]:
-                lines.append(f"• {w}")
-            lines.append("")
 
-        # ===== خطة التداول =====
-        if levels:
-            lines.append("━━━━━━━━━━━━━━━━━━━")
-            lines.append("🎯 <b>خطة التداول</b>")
-            lines.append("")
-            lines.append(f"📍 الدخول: {_num(levels.get('entry_low'))} – {_num(levels.get('entry_high'))}")
-            lines.append(f"🛑 الوقف: {_num(levels.get('stop_loss'))}")
-            lines.append(f"🎯 TP1: {_num(levels.get('tp1'))}")
-            lines.append(f"🎯 TP2: {_num(levels.get('tp2'))}")
-            lines.append(f"⚖️ R:R: 1 : {levels.get('rr', '—')}")
-            lines.append("")
-
+        # ===== بناء النص =====
+        lines = []
+        lines.append(f"🧠 <b>{symbol}</b> — {decision_short}")
         lines.append("━━━━━━━━━━━━━━━━━━━")
-        lines.append("🧠 <i>Smart Analyst</i>")
+        lines.append(f"💰 {_num(price)} | 📊 {score} | 🎯 ثقة {confidence}%")
+        lines.append("")
+        lines.append(f"💡 <b>لماذا؟</b>")
+        lines.append(f"  {why}")
+
+        if regime:
+            regime_ar = {
+                "trending": "📈 اتجاه قوي",
+                "ranging": "↔️ سوق جانبي",
+                "low_vol": "😴 تقلب منخفض",
+                "high_vol": "🔥 تقلب عالٍ",
+                "neutral": "⚖️ محايد",
+            }.get(regime, "")
+            if regime_ar:
+                lines.append(f"  {regime_ar}")
+
+        # التحذيرات (1-2 فقط)
+        if critical:
+            lines.append("")
+            lines.append("⚠️ <b>تحذير:</b>")
+            for w in critical[:2]:
+                lines.append(f"  • {w}")
+
+        # خطة (فقط BUY/SELL)
+        if levels and "BUY" in state or levels and "SELL" in state:
+            lines.append("")
+            lines.append("━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"📍 {_num(levels.get('entry_low'), 4)} – {_num(levels.get('entry_high'), 4)}")
+            lines.append(f"🛑 {_num(levels.get('stop_loss'), 4)}")
+            lines.append(f"🎯 {_num(levels.get('tp1'), 4)} | {_num(levels.get('tp2'), 4)}")
+            lines.append(f"⚖️ R:R 1:{levels.get('rr', '—')}")
+
+        lines.append("")
+        lines.append(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M')}")
 
         return "\n".join(lines)
 
     except Exception as e:
-        print(f"[{symbol}] {e}")
+        print(f"[essence {symbol}] {e}")
         return None
 
 
 # ============================================================
-# إرسال لكل العملات
+# إرسال كل العملات
 # ============================================================
-async def send_all(bot, tag: str = ""):
+async def send_all(bot, tag=""):
     sent = 0
     for s in SYMBOLS:
         try:
-            text = build_opinion(s)
+            text = build_essence(s)
             if text and CHAT_ID:
                 await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
                 sent += 1
@@ -206,14 +230,14 @@ async def send_all(bot, tag: str = ""):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     text = (
-        "🧠 <b>رأي المحلل</b>\n"
+        "🧠 <b>زبدة التحليل</b>\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
-        "يُرسل رأي المحلل لكل عملة:\n"
-        "⏰ كل ساعة\n"
-        "⚡ عند تغير مفاجئ\n\n"
+        "ملخص ذكي لكل عملة + إشعارات فورية.\n\n"
         f"📌 <b>Chat ID:</b> <code>{cid}</code>\n\n"
-        "/report — الآن (كل العملات)\n"
-        "/symbol BTC/USDT — عملة محددة"
+        "<b>الأوامر:</b>\n"
+        "/report — كل العملات الآن\n"
+        "/symbol BTC/USDT — عملة محددة\n"
+        "/alerts — حالة الإشعارات"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -221,7 +245,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ جاري التحليل...")
     n = await send_all(context.bot, tag="manual")
-    await update.message.reply_text(f"✅ تم إرسال {n} تقرير")
+    await update.message.reply_text(f"✅ {n} تقرير")
 
 
 async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -229,24 +253,105 @@ async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("استخدم: /symbol BTC/USDT")
         return
     sym = context.args[0].upper()
-    text = build_opinion(sym)
+    text = build_essence(sym)
     if text:
         await update.message.reply_text(text, parse_mode="HTML")
     else:
-        await update.message.reply_text(f"❌ لا توجد بيانات لـ {sym}")
+        await update.message.reply_text(f"❌ لا بيانات لـ {sym}")
+
+
+async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🔔 <b>الإشعارات النشطة</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚡ <b>تغيرات مفاجئة</b>\n"
+        "   فحص كل 5 دقائق\n"
+        "   يُرسل عند:\n"
+        "   • تغير الحالة (WATCH→BUY)\n"
+        "   • تغير Score ≥ 10 نقاط\n"
+        "   • Anomaly (high/medium)\n\n"
+        "🕐 <b>تقرير كل ساعة</b>\n"
+        "   8 عملات\n"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # ============================================================
-# Scheduled Jobs
+# Alert System — للكشف عن التغيرات
 # ============================================================
-async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
-    print(f"⏰ [HOURLY] {datetime.now(timezone.utc).strftime('%H:%M')}")
-    await send_all(context.bot, tag="hourly")
+_state_cache = {}  # {symbol: (state, score)}
 
 
-async def anomaly_job(context: ContextTypes.DEFAULT_TYPE):
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    """فحص كل 5 دقائق للتغيرات المفاجئة"""
     try:
-        since = (datetime.now(timezone.utc) - timedelta(minutes=ANOMALY_MIN + 2)).isoformat()
+        for symbol in SYMBOLS:
+            res = (
+                supabase.table("snapshots").select("*")
+                .eq("symbol", symbol)
+                .order("timestamp", desc=True)
+                .limit(2).execute()
+            )
+            if not res.data:
+                continue
+
+            curr = res.data[0]
+            prev = res.data[1] if len(res.data) > 1 else None
+
+            curr_state = curr.get("state")
+            curr_score = curr.get("total_score", 0)
+            curr_price = curr.get("price", 0)
+
+            # الحالة السابقة
+            last_state, last_score = _state_cache.get(symbol, (None, None))
+
+            # كشف التغير
+            reasons = []
+
+            # 1. تغير الحالة (مهم!)
+            if last_state and last_state != curr_state:
+                reasons.append(f"🔄 تغير الحالة: {last_state} → {curr_state}")
+
+            # 2. تغير score ≥ 10
+            if last_score is not None and abs(curr_score - last_score) >= 10:
+                delta = curr_score - last_score
+                reasons.append(f"📊 تغير Score: {last_score} → {curr_score} ({delta:+d})")
+
+            # 3. عند الانتقال إلى BUY/SELL SETUP (مهم جداً!)
+            if last_state in (None, "NO TRADE", "WATCH", "WAIT FOR CONFIRMATION"):
+                if curr_state in ("BUY SETUP", "STRONG BUY SETUP", "SELL SETUP", "STRONG SELL SETUP"):
+                    reasons.append(f"🚀 إشارة جديدة: {curr_state}")
+
+            # إرسال الإشعار
+            if reasons:
+                text = build_essence(symbol)
+                if text:
+                    header = f"⚡ <b>تغير مفاجئ — {symbol}</b>\n"
+                    header += "━━━━━━━━━━━━━━━━━━━\n"
+                    for r in reasons:
+                        header += f"{r}\n"
+                    header += "\n"
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=header + text,
+                        parse_mode="HTML",
+                    )
+                    print(f"⚡ [{symbol}] تغير مفاجئ")
+
+            # حفظ الحالة
+            _state_cache[symbol] = (curr_state, curr_score)
+
+    except Exception as e:
+        print(f"[alert_job] {e}")
+
+
+# ============================================================
+# Anomaly Alert — للكشف عن anomalies جديدة
+# ============================================================
+async def anomaly_job(context: ContextTypes.DEFAULT_TYPE):
+    """فحص anomalies كل 5 دقائق"""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
         rows = (
             supabase.table("anomalies").select("*")
             .gte("created_at", since)
@@ -263,16 +368,41 @@ async def anomaly_job(context: ContextTypes.DEFAULT_TYPE):
             if a.get("severity") not in ("high", "medium"):
                 continue
 
-            text = build_opinion(sym)
+            text = build_essence(sym)
             if text and CHAT_ID:
-                header = f"⚡ <b>تغير مفاجئ — {sym}</b>\n"
-                header += f"📌 {a.get('type')}\n\n"
+                anomaly_type = a.get("type", "")
+                severity_icon = "🚨" if a.get("severity") == "high" else "⚡"
+                
+                # ترجمة نوع anomaly
+                type_ar = {
+                    "volume_spike": "قفزة في الحجم",
+                    "orderflow_extreme": "انقلاب في دفتر الأوامر",
+                    "taker_aggressive_buy": "شراء تنفيذي عنيف",
+                    "taker_aggressive_sell": "بيع تنفيذي عنيف",
+                    "sharp_move": "تحرك حاد",
+                    "btc_shock": "صدمة BTC",
+                }.get(anomaly_type, anomaly_type)
+
+                header = f"{severity_icon} <b>حدث مفاجئ — {sym}</b>\n"
+                header += f"📌 {type_ar}\n"
+                header += "━━━━━━━━━━━━━━━━━━━\n\n"
+
                 await context.bot.send_message(
-                    chat_id=CHAT_ID, text=header + text, parse_mode="HTML"
+                    chat_id=CHAT_ID,
+                    text=header + text,
+                    parse_mode="HTML",
                 )
-                print(f"⚡ [{sym}] anomaly")
+                print(f"{severity_icon} [{sym}] {anomaly_type}")
     except Exception as e:
-        print(f"[anomaly] {e}")
+        print(f"[anomaly_job] {e}")
+
+
+# ============================================================
+# Scheduled — تقرير كل ساعة
+# ============================================================
+async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
+    print(f"⏰ [HOURLY] {datetime.now(timezone.utc).strftime('%H:%M')}")
+    await send_all(context.bot, tag="hourly")
 
 
 # ============================================================
@@ -300,19 +430,28 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("symbol", cmd_symbol))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
 
+    # Jobs
     if app.job_queue:
+        # تقرير كل ساعة
         app.job_queue.run_repeating(
             hourly_job, interval=HOURLY_MIN * 60, first=10, name="hourly"
         )
+        # فحص التغيرات كل 5 دقائق
         app.job_queue.run_repeating(
-            anomaly_job, interval=ANOMALY_MIN * 60, first=60, name="anomaly"
+            alert_job, interval=ALERT_MIN * 60, first=30, name="alerts"
         )
-        print(f"⏰ كل {HOURLY_MIN} دقيقة: كل العملات")
-        print(f"⚡ كل {ANOMALY_MIN} دقيقة: تغيرات مفاجئة")
+        # فحص anomalies كل 5 دقائق
+        app.job_queue.run_repeating(
+            anomaly_job, interval=ALERT_MIN * 60, first=45, name="anomalies"
+        )
+        print(f"⏰ كل {HOURLY_MIN} دقيقة: تقرير")
+        print(f"⚡ كل {ALERT_MIN} دقائق: تغيرات + anomalies")
 
     print("✅ Bot جاهز")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
