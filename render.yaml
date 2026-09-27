@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: smart-analyst-analyst-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: TELEGRAM_REPORT_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_REPORT_CHAT_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
