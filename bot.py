@@ -42,7 +42,7 @@ def _num(n, digits=4):
 def _emoji(state):
     if "STRONG BUY" in state: return "🟢🔥"
     if "BUY" in state: return "🟢"
-    if state == "WAIT FOR CONFIRMATION": return "🔵"
+    if state == "EARLY OPPORTUNITY": return "🔵"
     if "WATCH" in state: return "🟡"
     if "STRONG SELL" in state: return "🔴🔥"
     if "SELL" in state: return "🔴"
