@@ -142,7 +142,7 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
 
     # القرار النهائي
     if m["available"]:
-        final = final_confidence(signal_conf, m["agreement"])
+        final = final_confidence(signal_conf, m["agreement"], direction)
     else:
         final = signal_conf
 
