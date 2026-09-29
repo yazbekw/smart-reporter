@@ -204,31 +204,33 @@ async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعرض إحصائيات المصفوفة للرمز الحالي"""
-    if not context.args:
-        await update.message.reply_text("استخدم: /matrix BTC")
-        return
-    sym = context.args[0].upper()
-    if "/" not in sym:
-        sym = sym + "/USDT"
+    """إحصائيات المصفوفة"""
+    from matrix import debug_matrix
+
+    sym = "BTC/USDT"
+    if context.args:
+        s = context.args[0].upper()
+        sym = s if "/" in s else s + "/USDT"
 
     now = datetime.now(timezone.utc)
     m = agreement_score(sym, "LONG", now)
 
     if not m["available"]:
-        await update.message.reply_text(
+        # عرض معلومات تشخيصية
+        debug = debug_matrix(sym, now)
+        text = (
             f"📊 <b>{sym}</b>\n"
-            f"لا توجد بيانات كافية للسلوت الحالي.\n"
-            f"<i>{m.get('reason', '')}</i>",
-            parse_mode="HTML",
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"❌ {m.get('reason', 'غير معروف')}\n\n"
+            f"<b>تشخيص:</b>\n"
+            f"<code>{debug}</code>"
         )
+        await update.message.reply_text(text, parse_mode="HTML")
         return
 
     text = (
-        f"📊 <b>المصفوفة — {sym}</b>\n"
+        f"📊 <b>{sym}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {now.strftime('%H:%M')} UTC | "
-        f"يوم {now.weekday()} | سلوت {m.get('source') and now.hour*4 + now.minute//15}\n\n"
         f"• Win Rate: <b>{m['win_rate']}%</b>\n"
         f"• متوسط العائد: {m['avg_return']}%\n"
         f"• العينة: {m['n']} صفقة\n"
@@ -236,7 +238,6 @@ async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• المصدر: {m['source']}\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
-
 
 # ============================================================
 # Scheduled
