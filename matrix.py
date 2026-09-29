@@ -1,300 +1,511 @@
 """
-تحميل المصفوفة + تطبيع البنية + حساب التوافق.
-يدعم كل البنيات المحتملة.
+Smart Analyst — رأي المحلل + المصفوفة الإحصائية.
+يدعم:
+- EARLY BUY / EARLY SELL
+- تفسير اتجاه المصفوفة (احتمال صعود/هبوط)
+- إشعارات التغيرات المفاجئة
+- الدرجة المركبة + سياق اليوم
 """
-import json
-from pathlib import Path
-from datetime import datetime, timezone
+import os
+import threading
+import logging
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import NetworkError, TimedOut
+from supabase import create_client
 
-MATRIX_PATH = Path(__file__).resolve().parent / "matrix_15min.json"
-_matrix = None
+from matrix import (
+    agreement_score,
+    final_confidence,
+    matrix_composite_score,
+    day_context,
+    debug_matrix,
+    format_matrix_message,
+)
 
-ARABIC_DAYS = {
-    "الإثنين": 0, "الاثنين": 0, "Monday": 0,
-    "الثلاثاء": 1, "Tuesday": 1,
-    "الأربعاء": 2, "الاربعاء": 2, "Wednesday": 2,
-    "الخميس": 3, "Thursday": 3,
-    "الجمعة": 4, "Friday": 4,
-    "السبت": 5, "Saturday": 5,
-    "الأحد": 6, "الاحد": 6, "Sunday": 6,
-}
+load_dotenv()
 
+BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_REPORT_CHAT_ID")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-def _load():
-    global _matrix
-    if _matrix is not None:
-        return _matrix
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    if not MATRIX_PATH.exists():
-        print(f"⚠️ {MATRIX_PATH} غير موجود")
-        _matrix = {}
-        return _matrix
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
+           "XRP/USDT", "ADA/USDT", "AVAX/USDT", "DOGE/USDT"]
 
-    with open(MATRIX_PATH, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    _matrix = _normalize(raw)
-    print(f"📊 matrix loaded: {[k for k in _matrix if not k.startswith('_')]}")
-    return _matrix
-
-
-def _normalize(raw: dict) -> dict:
-    normalized = {}
-
-    for meta in ["generated_at", "days_back"]:
-        if meta in raw:
-            normalized[f"_meta_{meta}"] = raw[meta]
-
-    source = raw
-    if "symbols" in raw and isinstance(raw["symbols"], dict):
-        source = raw["symbols"]
-
-    if "combined" in raw and isinstance(raw["combined"], dict):
-        normalized["__combined__"] = _normalize_symbol_data(raw["combined"])
-    elif "__combined__" in source:
-        normalized["__combined__"] = _normalize_symbol_data(source["__combined__"])
-
-    for sym, data in source.items():
-        if sym.startswith("_"):
-            continue
-        normalized[sym.upper()] = _normalize_symbol_data(data)
-
-    return normalized
+HOURLY_MIN = 60
+ALERT_MIN = 5
 
 
-def _normalize_symbol_data(data) -> dict:
-    if isinstance(data, dict):
-        if "days" in data and isinstance(data["days"], dict):
-            data = data["days"]
-        return _normalize_weekday_dict(data)
-    if isinstance(data, list):
-        return _normalize_list_of_rows(data)
-    return {}
+# ============================================================
+# Logging
+# ============================================================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
-def _normalize_weekday_dict(data: dict) -> dict:
-    result = {}
-    for day_key, slots_data in data.items():
-        if str(day_key).startswith("_"):
-            continue
-
-        day_num = _day_to_num(day_key)
-        if day_num is None:
-            continue
-
-        if isinstance(slots_data, dict):
-            result[str(day_num)] = _normalize_slots(slots_data)
-        elif isinstance(slots_data, list):
-            result[str(day_num)] = _normalize_slots_list(slots_data)
-
-    return result
+async def error_handler(update, context):
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"⚠️ network: {err}")
+        return
+    logger.error(f"❌ error: {err}", exc_info=err)
 
 
-def _day_to_num(day_key) -> int | None:
-    s = str(day_key).strip()
-    if s.isdigit() and 0 <= int(s) <= 6:
-        return int(s)
-    if s in ARABIC_DAYS:
-        return ARABIC_DAYS[s]
-    for name, num in ARABIC_DAYS.items():
-        if name in s or s in name:
-            return num
-    return None
-
-
-def _normalize_slots(data: dict) -> dict:
-    result = {}
-    for k, v in data.items():
-        k_str = str(k).replace("slot_", "").replace("slot", "").strip()
-        if k_str.isdigit() and isinstance(v, dict):
-            result[k_str] = _normalize_row(v)
-    return result
-
-
-def _normalize_slots_list(data: list) -> dict:
-    result = {}
-    for row in data:
-        if not isinstance(row, dict):
-            continue
-        slot = row.get("slot")
-        if slot is None:
-            continue
-        result[str(int(slot))] = _normalize_row(row)
-    return result
-
-
-def _normalize_list_of_rows(data: list) -> dict:
-    result = {}
-    for row in data:
-        if not isinstance(row, dict):
-            continue
-        wd = row.get("weekday")
-        slot = row.get("slot")
-        if wd is None or slot is None:
-            continue
-        wd_str = str(int(wd))
-        slot_str = str(int(slot))
-        result.setdefault(wd_str, {})
-        result[wd_str][slot_str] = _normalize_row(row)
-    return result
-
-
-def _normalize_row(row: dict) -> dict:
-    return {
-        "wr": float(row.get("win_rate", row.get("wr", 0))),
-        "ar": float(row.get("avg_return", row.get("ret", row.get("ar", 0)))),
-        "n": int(row.get("n", 0)),
-        "t": float(row.get("t_stat", row.get("t", 0))),
-    }
-
-
-def _symbol_key(symbol: str) -> str:
+# ============================================================
+# Helpers
+# ============================================================
+def _short(symbol: str) -> str:
+    """BTC/USDT → BTC"""
     return symbol.split("/")[0].upper()
 
 
-# ============================================================
-# البحث
-# ============================================================
-def get_matrix_stats(symbol: str, dt: datetime | None = None,
-                     allow_combined: bool = True) -> dict | None:
-    m = _load()
-    if not m:
-        return None
+def _confidence(snap: dict) -> int:
+    """ثقة الإشارة (0-100)"""
+    score = abs(snap.get("total_score", 0))
+    details = snap.get("details") or {}
+    regime = (details.get("regime") or {}).get("regime", "")
 
-    if dt is None:
-        dt = datetime.now(timezone.utc)
+    breakdown = [
+        snap.get("trend_score", 0),
+        snap.get("momentum_score", 0),
+        snap.get("volume_score", 0),
+        snap.get("orderflow_score", 0),
+        snap.get("structure_score", 0),
+        snap.get("context_score", 0),
+    ]
 
-    weekday = dt.weekday()
-    slot = (dt.hour * 60 + dt.minute) // 15
-    sym = _symbol_key(symbol)
+    base = min(score * 3, 60)
 
-    # جرب الرمز أولاً
-    if sym in m:
-        try:
-            data = m[sym][str(weekday)][str(slot)]
-            data["source"] = sym
-            data["weekday"] = weekday
-            data["slot"] = slot
-            return data
-        except (KeyError, TypeError):
-            pass
+    regime_bonus = 0
+    if regime == "trending": regime_bonus = 20
+    elif regime == "ranging": regime_bonus = 5
+    elif regime == "high_vol": regime_bonus = -10
 
-    # fallback إلى __combined__
-    if allow_combined and "__combined__" in m:
-        try:
-            data = m["__combined__"][str(weekday)][str(slot)]
-            data["source"] = "__combined__"
-            data["weekday"] = weekday
-            data["slot"] = slot
-            return data
-        except (KeyError, TypeError):
-            pass
+    positive = sum(1 for b in breakdown if b > 2)
+    negative = sum(1 for b in breakdown if b < -2)
+    harmony = (positive - negative) * 5
 
+    return max(0, min(100, int(base + regime_bonus + harmony)))
+
+
+def _action_text(state: str, symbol: str) -> str | None:
+    s = _short(symbol)
+    if "STRONG BUY" in state:
+        return f"🟢🔥 اشتر بقوة {s}"
+    if "EARLY BUY" in state:
+        return f"🔵 فرصة شراء مبكرة — {s}"
+    if "BUY" in state:
+        return f"🟢 اشتر {s}"
+    if "STRONG SELL" in state:
+        return f"🔴🔥 بع بقوة {s}"
+    if "EARLY SELL" in state:
+        return f"🔵 فرصة بيع مبكرة — {s}"
+    if "SELL" in state:
+        return f"🔴 بع {s}"
     return None
 
 
-def agreement_score(symbol: str, direction: str, dt: datetime | None = None,
-                    min_samples: int = 10) -> dict:
-    stats = get_matrix_stats(symbol, dt)
-
-    if not stats:
-        return {
-            "available": False, "agreement": None,
-            "win_rate": None, "avg_return": None,
-            "n": 0, "t_stat": 0, "source": None,
-            "reason": "السلوت غير موجود في المصفوفة",
-        }
-
-    if stats["n"] < min_samples:
-        return {
-            "available": False, "agreement": None,
-            "win_rate": stats["wr"], "avg_return": stats["ar"],
-            "n": stats["n"], "t_stat": stats["t"],
-            "source": stats["source"],
-            "reason": f"عينة صغيرة (n={stats['n']})",
-        }
-
-    wr = stats["wr"]
-    agreement = (100 - wr) if direction.upper() == "SHORT" else wr
-
-    return {
-        "available": True,
-        "agreement": round(agreement, 1),
-        "win_rate": wr,
-        "avg_return": stats["ar"],
-        "n": stats["n"],
-        "t_stat": stats["t"],
-        "source": stats["source"],
-    }
-
-
-def final_confidence(signal_conf: int, matrix_agreement: float | None,
-                     direction: str = None, weight_signal: float = 0.6) -> int:
-    """
-    دمج ثقة الإشارة مع توافق المصفوفة.
-    direction: معامل اختياري (متوافق مع الاستدعاءات القديمة).
-    """
-    if matrix_agreement is None:
-        return signal_conf
-    weight_matrix = 1.0 - weight_signal
-    combined = (signal_conf * weight_signal) + (matrix_agreement * weight_matrix)
-    return int(round(combined))
+def _is_buy_state(state: str) -> bool:
+    return "BUY" in state
 
 
 # ============================================================
-# تشخيص
+# بناء الرسالة المختصرة
 # ============================================================
-def debug_matrix(symbol: str, dt: datetime | None = None) -> str:
-    m = _load()
-    if not m:
-        return "⚠️ المصفوفة غير محملة"
+def build_short_signal(symbol: str, state: str, signal_conf: int,
+                       direction: str = "LONG",
+                       full_details: bool = False) -> str | None:
+    action = _action_text(state, symbol)
+    if not action:
+        return None
 
-    if dt is None:
-        dt = datetime.now(timezone.utc)
+    # استخدام النظام الجديد: final_confidence(signal_conf, symbol, direction) → dict
+    result = final_confidence(signal_conf, symbol, direction)
 
-    weekday = dt.weekday()
-    slot = (dt.hour * 60 + dt.minute) // 15
-    sym = _symbol_key(symbol)
+    lines = [action]
+    lines.append(f"🎯 ثقة الإشارة: <b>{signal_conf}%</b>")
 
-    lines = [
-        f"🕐 {dt.strftime('%H:%M')} UTC",
-        f"📅 weekday: {weekday}",
-        f"🎯 slot: {slot}",
-        "",
-    ]
+    if result.get("available"):
+        source = result.get("source", "?")
+        if source == "__combined__":
+            lines.append(f"⚠️ <i>لا توجد بيانات {_short(symbol)} — متوسط السوق</i>")
 
-    keys = [k for k in m.keys() if not k.startswith("_")]
-    lines.append(f"📋 الرموز: {', '.join(keys)}")
-    lines.append("")
+        is_buy = _is_buy_state(state)
+        direction_label = "احتمال صعود" if is_buy else "احتمال هبوط"
 
-    if "_meta_generated_at" in m:
-        lines.append(f"🕒 generated: {m['_meta_generated_at']}")
-    if "_meta_days_back" in m:
-        lines.append(f"📅 days_back: {m['_meta_days_back']}")
-    lines.append("")
+        lines.append(f"📊 توافق المصفوفة: <b>{result['composite_adjusted']}%</b> ({direction_label})")
+        lines.append(f"⚡ <b>القرار النهائي: {result['final']}%</b>")
 
-    if sym in m:
-        days_available = sorted(m[sym].keys(), key=lambda x: int(x))
-        lines.append(f"📅 أيام {sym}: {days_available}")
-        wd_key = str(weekday)
-        if wd_key in m[sym]:
-            slots = sorted(m[sym][wd_key].keys(), key=lambda x: int(x))
-            lines.append(f"✅ يوم {wd_key} — {len(slots)} سلوت")
-            if str(slot) in m[sym][wd_key]:
-                d = m[sym][wd_key][str(slot)]
-                lines.append(f"   wr={d['wr']}%, n={d['n']}, t={d['t']}")
-            else:
-                lines.append(f"   ⚠️ السلوت {slot} غير موجود")
-        else:
-            lines.append(f"⚠️ يوم {weekday} غير موجود")
-    else:
-        lines.append(f"⚠️ {sym} غير موجود")
+        # تحذير من التوافق المنخفض
+        if result['composite_adjusted'] < 45:
+            lines.append("🚨 <b>تحذير: المصفوفة لا تدعم الإشارة!</b>")
 
-    if "__combined__" in m:
-        wd_key = str(weekday)
-        if wd_key in m["__combined__"] and str(slot) in m["__combined__"][wd_key]:
-            d = m["__combined__"][wd_key][str(slot)]
+        # سياق اليوم (إذا ليس محايداً)
+        day_ctx = result.get("day_ctx")
+        if day_ctx and day_ctx.get("bias") != "neutral":
+            lines.append(
+                f"{day_ctx['emoji']} سياق اليوم ({day_ctx['day_name']}): "
+                f"<i>{day_ctx['bias']}</i>"
+            )
+
+        # تفاصيل كاملة
+        if full_details:
+            raw = result.get("raw", {})
             lines.append("")
-            lines.append(f"✅ __combined__: wr={d['wr']}%, n={d['n']}")
+            lines.append("<i>تفصيل:</i>")
+            lines.append(f"<i>• WR: {raw.get('wr', 0)}% | RET: {raw.get('ret', 0):+.4f}%</i>")
+            lines.append(f"<i>• t: {raw.get('t', 0):+.3f} | n: {raw.get('n', 0)}</i>")
+            lines.append(
+                f"<i>• أوزان: إشارة {result['weight_signal']} | "
+                f"مصفوفة {result['weight_matrix']}</i>"
+            )
+            if result.get("day_bonus", 0) != 0:
+                sign = "+" if result["day_bonus"] > 0 else ""
+                lines.append(f"<i>• مكافأة اليوم: {sign}{result['day_bonus']}</i>")
+    else:
+        reason = result.get("reason", "لا توجد بيانات")
+        lines.append(f"📊 المصفوفة: <i>{reason}</i>")
+        lines.append(f"⚡ <b>القرار النهائي: {signal_conf}%</b>")
 
     return "\n".join(lines)
+
+
+# ============================================================
+# الفحص الأساسي
+# ============================================================
+def get_latest_snapshot(symbol: str) -> dict | None:
+    res = (
+        supabase.table("snapshots").select("*")
+        .eq("symbol", symbol)
+        .order("timestamp", desc=True)
+        .limit(1).execute()
+    )
+    return res.data[0] if res.data else None
+
+
+# ============================================================
+# Handlers
+# ============================================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    text = (
+        "🧠 <b>رأي المحلل + المصفوفة</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "رسائل مختصرة:\n"
+        "• الإجراء (اشتر/بع) — مع اتجاه واضح\n"
+        "• ثقة الإشارة\n"
+        "• توافق المصفوفة (احتمال صعود/هبوط)\n"
+        "• سياق اليوم\n"
+        "• القرار النهائي\n\n"
+        f"📌 <b>Chat ID:</b> <code>{cid}</code>\n\n"
+        "<b>الأوامر:</b>\n"
+        "/now — فحص فوري (كل العملات)\n"
+        "/sym BTC/USDT — رمز محدد\n"
+        "/matrix BTC — إحصاء المصفوفة\n"
+        "/full BTC — تقرير غني كامل\n"
+        "/raw — تشخيص المصفوفة"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ جاري الفحص...")
+    sent = 0
+    for symbol in SYMBOLS:
+        snap = get_latest_snapshot(symbol)
+        if not snap:
+            continue
+
+        state = snap.get("state", "NO TRADE")
+        if state in ("NO TRADE", "WATCH"):
+            continue
+
+        conf = _confidence(snap)
+        direction = "LONG" if _is_buy_state(state) else "SHORT"
+        msg = build_short_signal(symbol, state, conf, direction, full_details=True)
+
+        if msg:
+            await update.message.reply_text(msg, parse_mode="HTML")
+            sent += 1
+
+    if sent == 0:
+        await update.message.reply_text("لا توجد إشارات نشطة حالياً.")
+
+
+async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("استخدم: /sym BTC/USDT")
+        return
+
+    sym = context.args[0].upper()
+    if "/" not in sym:
+        sym = sym + "/USDT"
+
+    snap = get_latest_snapshot(sym)
+    if not snap:
+        await update.message.reply_text(f"❌ لا توجد بيانات لـ {sym}")
+        return
+
+    state = snap.get("state", "NO TRADE")
+    conf = _confidence(snap)
+    direction = "LONG" if _is_buy_state(state) else "SHORT"
+    msg = build_short_signal(sym, state, conf, direction, full_details=True)
+
+    if msg:
+        await update.message.reply_text(msg, parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"⚪ {sym}: {state} — لا إشارة")
+
+
+async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعرض إحصائيات المصفوفة + الدرجة المركبة + سياق اليوم"""
+    sym = "BTC/USDT"
+    if context.args:
+        s = context.args[0].upper()
+        sym = s if "/" in s else s + "/USDT"
+
+    now = datetime.now(timezone.utc)
+    m = agreement_score(sym, "LONG", now)
+
+    if not m["available"]:
+        debug = debug_matrix(sym, now)
+        text = (
+            f"📊 <b>{sym}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"❌ {m.get('reason', 'غير معروف')}\n\n"
+            f"<b>تشخيص:</b>\n"
+            f"<code>{debug}</code>"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+
+    comp_long = matrix_composite_score(sym, "LONG", now)
+    comp_short = matrix_composite_score(sym, "SHORT", now)
+    day_ctx = day_context(sym, dt=now)
+
+    text = (
+        f"📊 <b>{sym}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>البيانات الخام:</b>\n"
+        f"• Win Rate: <b>{m['win_rate']}%</b>\n"
+        f"• متوسط العائد: {m['avg_return']:+.4f}%\n"
+        f"• العينة: {m['n']} صفقة\n"
+        f"• t-stat: {m['t_stat']:+.3f}\n"
+        f"• المصدر: {m['source']}\n"
+    )
+
+    if comp_long and comp_short:
+        text += (
+            f"\n<b>الدرجة المركبة:</b>\n"
+            f"• 🟢 LONG: <b>{comp_long['composite']}%</b>\n"
+            f"• 🔴 SHORT: <b>{comp_short['composite']}%</b>\n"
+        )
+
+    if day_ctx:
+        text += (
+            f"\n<b>سياق اليوم ({day_ctx['day_name']}):</b>\n"
+            f"{day_ctx['emoji']} {day_ctx['bias']} "
+            f"(WR={day_ctx['avg_wr']}%, RET={day_ctx['avg_ret']:+.4f}%)\n"
+        )
+
+    text += (
+        f"\n<i>تفسير:</i>\n"
+        f"• LONG → {m['win_rate']}% (احتمال صعود)\n"
+        f"• SHORT → {round(100 - m['win_rate'], 1)}% (احتمال هبوط)"
+    )
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تقرير غني كامل للمصفوفة"""
+    sym = "BTC/USDT"
+    if context.args:
+        s = context.args[0].upper()
+        sym = s if "/" in s else s + "/USDT"
+
+    snap = get_latest_snapshot(sym)
+    if not snap:
+        await update.message.reply_text(f"❌ لا توجد بيانات لـ {sym}")
+        return
+
+    state = snap.get("state", "NO TRADE")
+    conf = _confidence(snap)
+    direction = "LONG" if _is_buy_state(state) else "SHORT"
+
+    # نتيجة كاملة
+    result = final_confidence(conf, sym, direction)
+
+    # رسالة غنية من matrix
+    msg = format_matrix_message(sym, result)
+
+    # Telegram يفضّل عرض الرسالة داخل <pre>
+    await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
+
+
+async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تشخيص المصفوفة"""
+    debug = debug_matrix("BTC/USDT")
+    await update.message.reply_text(f"<code>{debug}</code>", parse_mode="HTML")
+
+
+# ============================================================
+# Scheduled Jobs
+# ============================================================
+async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
+    print(f"⏰ [HOURLY] {datetime.now(timezone.utc).strftime('%H:%M')}")
+    sent = 0
+
+    for symbol in SYMBOLS:
+        try:
+            snap = get_latest_snapshot(symbol)
+            if not snap:
+                continue
+
+            state = snap.get("state", "NO TRADE")
+            if state in ("NO TRADE", "WATCH"):
+                continue
+
+            conf = _confidence(snap)
+            direction = "LONG" if _is_buy_state(state) else "SHORT"
+            msg = build_short_signal(symbol, state, conf, direction)
+
+            if msg and CHAT_ID:
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=msg,
+                    parse_mode="HTML",
+                )
+                sent += 1
+                print(f"✅ [{symbol}] أُرسل")
+        except Exception as e:
+            print(f"❌ [{symbol}] {e}")
+
+    if sent == 0:
+        print("⚠️ لا توجد إشارات في هذه الساعة")
+
+
+_state_cache = {}
+
+
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        res = (
+            supabase.table("snapshots").select("*")
+            .order("timestamp", desc=True)
+            .limit(40).execute()
+        )
+        rows = res.data or []
+
+        latest = {}
+        for r in rows:
+            s = r["symbol"]
+            if s not in latest:
+                latest[s] = r
+
+        for symbol, snap in latest.items():
+            state = snap.get("state")
+            score = snap.get("total_score", 0)
+            last = _state_cache.get(symbol)
+
+            if last and last[0] != state:
+                if state in ("STRONG BUY SETUP", "BUY SETUP",
+                             "STRONG SELL SETUP", "SELL SETUP",
+                             "EARLY BUY", "EARLY SELL"):
+                    conf = _confidence(snap)
+                    direction = "LONG" if _is_buy_state(state) else "SHORT"
+                    msg = build_short_signal(symbol, state, conf, direction)
+
+                    if msg and CHAT_ID:
+                        header = f"⚡ <b>تغير مفاجئ — {_short(symbol)}</b>\n"
+                        header += f"<i>{last[0]} → {state}</i>\n\n"
+                        await context.bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=header + msg,
+                            parse_mode="HTML",
+                        )
+                        print(f"⚡ [{symbol}] {last[0]} → {state}")
+
+            _state_cache[symbol] = (state, score)
+    except Exception as e:
+        print(f"[alert_job] {e}")
+
+
+# ============================================================
+# Health Server
+# ============================================================
+class _H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+def _run_health():
+    port = int(os.getenv("PORT", "8080"))
+    HTTPServer(("0.0.0.0", port), _H).serve_forever()
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    threading.Thread(target=_run_health, daemon=True).start()
+    print("🧠 Analyst Bot + Matrix يبدأ...")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("now", cmd_now))
+    app.add_handler(CommandHandler("sym", cmd_symbol))
+    app.add_handler(CommandHandler("matrix", cmd_matrix))
+    app.add_handler(CommandHandler("full", cmd_full))
+    app.add_handler(CommandHandler("raw", cmd_raw))
+    app.add_error_handler(error_handler)
+
+    # Jobs
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            hourly_job, interval=HOURLY_MIN * 60, first=10, name="hourly"
+        )
+        app.job_queue.run_repeating(
+            alert_job, interval=ALERT_MIN * 60, first=30, name="alerts"
+        )
+        print(f"⏰ كل {HOURLY_MIN} دقيقة: رسائل مختصرة")
+        print(f"⚡ كل {ALERT_MIN} دقائق: تغيرات مفاجئة")
+
+    print("✅ Bot جاهز")
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        bootstrap_retries=5,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
+
+
+if __name__ == "__main__":
+    main()
