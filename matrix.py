@@ -1,42 +1,70 @@
 """
 تحميل المصفوفة والبحث فيها + حساب التوافق.
-- يحاول الرمز المحدد أولاً
-- ثم __combined__ كـ fallback
+- يدعم بنيتين:
+  1) { "BTC": {...}, "__combined__": {...} }
+  2) { "symbols": {...}, "combined": {...}, "generated_at": ... }
 """
 import json
 from pathlib import Path
 from datetime import datetime, timezone
 
-# ⚠️ عدّل المسار حسب مكان الملف
 MATRIX_PATH = Path(__file__).resolve().parent / "matrix_15min.json"
 
-# تحميل مرة واحدة
 _matrix = None
 
 
+# ============================================================
+# تحميل المصفوفة + تطبيع البنية
+# ============================================================
 def _load():
     global _matrix
-    if _matrix is None:
-        if not MATRIX_PATH.exists():
-            print(f"⚠️ {MATRIX_PATH} غير موجود")
-            _matrix = {}
-        else:
-            with open(MATRIX_PATH, "r", encoding="utf-8") as f:
-                _matrix = json.load(f)
-            print(f"📊 تم تحميل المصفوفة: {len(_matrix)} رموز")
+    if _matrix is not None:
+        return _matrix
+
+    if not MATRIX_PATH.exists():
+        print(f"⚠️ {MATRIX_PATH} غير موجود")
+        _matrix = {}
+        return _matrix
+
+    with open(MATRIX_PATH, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    normalized = {}
+
+    # ============ الحالة 1: بنية مع "symbols" و "combined" ============
+    if "symbols" in raw or "combined" in raw:
+        if "symbols" in raw and isinstance(raw["symbols"], dict):
+            for sym, data in raw["symbols"].items():
+                normalized[sym.upper()] = data
+
+        if "combined" in raw and isinstance(raw["combined"], dict):
+            normalized["__combined__"] = raw["combined"]
+
+        # احفظ معلومات إضافية
+        if "generated_at" in raw:
+            normalized["_meta_generated_at"] = raw["generated_at"]
+        if "days_back" in raw:
+            normalized["_meta_days_back"] = raw["days_back"]
+
+        _matrix = normalized
+        print(f"📊 محملة (normalized): {len([k for k in normalized if not k.startswith('_')])} رموز")
+
+    # ============ الحالة 2: بنية مسطحة قديمة ============
+    else:
+        _matrix = raw
+        print(f"📊 محملة (مسطحة): {list(raw.keys())}")
+
     return _matrix
 
 
 def _symbol_key(symbol: str) -> str:
-    """BTC/USDT → BTC"""
     return symbol.split("/")[0].upper()
 
 
+# ============================================================
+# جلب إحصائيات
+# ============================================================
 def get_matrix_stats(symbol: str, dt: datetime | None = None) -> dict | None:
-    """
-    يبحث عن الرمز + اليوم + السلوت.
-    إذا لم يجد الرمز → يستخدم __combined__ كـ fallback.
-    """
     m = _load()
     if not m:
         return None
@@ -44,11 +72,11 @@ def get_matrix_stats(symbol: str, dt: datetime | None = None) -> dict | None:
     if dt is None:
         dt = datetime.now(timezone.utc)
 
-    weekday = dt.weekday()                          # 0 = الإثنين
-    slot = (dt.hour * 60 + dt.minute) // 15         # 0-95
+    weekday = dt.weekday()
+    slot = (dt.hour * 60 + dt.minute) // 15
     sym = _symbol_key(symbol)
 
-    # جرب الرمز أولاً، ثم __combined__
+    # جرب الرمز ثم __combined__
     for key in [sym, "__combined__"]:
         if key not in m:
             continue
@@ -66,12 +94,6 @@ def get_matrix_stats(symbol: str, dt: datetime | None = None) -> dict | None:
 
 def agreement_score(symbol: str, direction: str, dt: datetime | None = None,
                     min_samples: int = 10) -> dict:
-    """
-    يحسب نسبة التوافق مع المصفوفة.
-    - LONG → win_rate كما هو
-    - SHORT → 100 - win_rate
-    - إذا n < min_samples → غير متوفر
-    """
     stats = get_matrix_stats(symbol, dt)
 
     if not stats:
@@ -114,10 +136,6 @@ def agreement_score(symbol: str, direction: str, dt: datetime | None = None,
 
 def final_confidence(signal_conf: int, matrix_agreement: float | None,
                      weight_signal: float = 0.6) -> int:
-    """
-    دمج ثقة الإشارة مع توافق المصفوفة.
-    - weight_signal = 0.6 → 60% إشارة + 40% مصفوفة
-    """
     if matrix_agreement is None:
         return signal_conf
     weight_matrix = 1.0 - weight_signal
@@ -125,10 +143,10 @@ def final_confidence(signal_conf: int, matrix_agreement: float | None,
     return int(round(combined))
 
 
+# ============================================================
+# تشخيص
+# ============================================================
 def debug_matrix(symbol: str, dt: datetime | None = None) -> str:
-    """
-    معلومات تشخيصية للسلوت الحالي — للاستخدام في /matrix
-    """
     m = _load()
     if not m:
         return "⚠️ المصفوفة غير محملة"
@@ -147,20 +165,26 @@ def debug_matrix(symbol: str, dt: datetime | None = None) -> str:
         "",
     ]
 
-    # الرموز المتاحة
-    keys = list(m.keys())
+    keys = [k for k in m.keys() if not k.startswith("_")]
     lines.append(f"📋 الرموز: {', '.join(keys)}")
     lines.append("")
 
-    # افحص الرمز
+    # معلومات الميتا
+    if "_meta_generated_at" in m:
+        lines.append(f"🕒 generated: {m['_meta_generated_at']}")
+    if "_meta_days_back" in m:
+        lines.append(f"📅 days_back: {m['_meta_days_back']}")
+    lines.append("")
+
+    # فحص الرمز
     if sym in m:
         wd_key = str(weekday)
         if wd_key in m[sym]:
             slots = list(m[sym][wd_key].keys())
-            lines.append(f"✅ {sym} متاح — {len(slots)} سلوت")
+            lines.append(f"✅ {sym} — {len(slots)} سلوت")
             if str(slot) in m[sym][wd_key]:
                 d = m[sym][wd_key][str(slot)]
-                lines.append(f"   البيانات: wr={d['wr']}%, n={d['n']}")
+                lines.append(f"   wr={d['wr']}%, n={d['n']}, t={d['t']}")
             else:
                 lines.append(f"   ⚠️ السلوت {slot} غير موجود")
         else:
@@ -168,7 +192,7 @@ def debug_matrix(symbol: str, dt: datetime | None = None) -> str:
     else:
         lines.append(f"⚠️ {sym} غير موجود")
 
-    # افحص __combined__
+    # __combined__
     if "__combined__" in m:
         wd_key = str(weekday)
         if wd_key in m["__combined__"]:
