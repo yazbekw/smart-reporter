@@ -92,18 +92,19 @@ def _confidence(snap: dict) -> int:
 
 
 def _action_text(state: str, symbol: str) -> str | None:
-    """نص الإجراء المختصر"""
     s = _short(symbol)
     if "STRONG BUY" in state:
         return f"🟢🔥 اشتر بقوة {s}"
+    if "EARLY BUY" in state:
+        return f"🔵 فرصة شراء مبكرة — {s}"
     if "BUY" in state:
         return f"🟢 اشتر {s}"
     if "STRONG SELL" in state:
         return f"🔴🔥 بع بقوة {s}"
+    if "EARLY SELL" in state:
+        return f"🔵 فرصة بيع مبكرة — {s}"
     if "SELL" in state:
         return f"🔴 بع {s}"
-    if state == "EARLY OPPORTUNITY":
-        return f"🔵 راقب {s}"
     return None
 
 
