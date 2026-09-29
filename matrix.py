@@ -64,8 +64,10 @@ def _normalize(raw: dict) -> dict:
 
 def _normalize_symbol(data) -> dict:
     """
-    يحوّل:
-      { "الإثنين": { "0": {...}, ... }, "الثلاثاء": {...} }
+    يحوّل بنية الملف الفعلية:
+      { "days": [ {"day": "الإثنين", "slots": [...]}, ... ] }
+    أو البنية القديمة:
+      { "الإثنين": {...}, ... }
     إلى:
       { "0": { "0": {...}, "1": {...} }, "1": {...} }
     """
@@ -73,11 +75,34 @@ def _normalize_symbol(data) -> dict:
         return {}
 
     result = {}
+
+    # ===== البنية الفعلية: {"days": [{"day": ..., "slots": [...]}, ...]} =====
+    if "days" in data and isinstance(data["days"], list):
+        for day_obj in data["days"]:
+            if not isinstance(day_obj, dict):
+                continue
+            day_name = day_obj.get("day")
+            slots_list = day_obj.get("slots", [])
+
+            day_num = _day_to_num(day_name)
+            if day_num is None:
+                continue
+
+            if isinstance(slots_list, list):
+                result[str(day_num)] = _normalize_slots_list(slots_list)
+            elif isinstance(slots_list, dict):
+                result[str(day_num)] = _normalize_slots(slots_list)
+        return result
+
+    # ===== البنية القديمة: {"الإثنين": {...}, ...} =====
     for day_key, slots_data in data.items():
         if str(day_key).startswith("_"):
             continue
 
-        # حوّل اليوم إلى رقم
+        # تخطي المفاتيح غير المتعلقة بالأيام
+        if day_key in ("days", "symbols", "combined"):
+            continue
+
         day_num = _day_to_num(day_key)
         if day_num is None:
             continue
@@ -92,13 +117,16 @@ def _normalize_symbol(data) -> dict:
 
 def _day_to_num(day_key) -> int | None:
     """يحوّل مفتاح اليوم إلى 0-6"""
+    if day_key is None:
+        return None
+
     s = str(day_key).strip()
 
     # رقم مباشر
     if s.isdigit() and 0 <= int(s) <= 6:
         return int(s)
 
-    # اسم عربي/إنجليزي
+    # اسم عربي/إنجليزي (بحث دقيق)
     if s in ARABIC_DAYS:
         return ARABIC_DAYS[s]
 
@@ -121,6 +149,7 @@ def _normalize_slots(data: dict) -> dict:
 
 
 def _normalize_slots_list(data: list) -> dict:
+    """يحوّل قائمة السلوتات إلى قاموس بمفاتيح رقمية"""
     result = {}
     for row in data:
         if not isinstance(row, dict):
@@ -133,6 +162,10 @@ def _normalize_slots_list(data: list) -> dict:
 
 
 def _normalize_row(row: dict) -> dict:
+    """
+    يوحّد حقول الصف. الملف الفعلي يستخدم:
+      ret (وليس ar), wr (وليس win_rate), n, t
+    """
     return {
         "wr": float(row.get("win_rate", row.get("wr", 0))),
         "ar": float(row.get("avg_return", row.get("ret", row.get("ar", 0)))),
@@ -165,6 +198,7 @@ def get_matrix_stats(symbol: str, dt: datetime | None = None) -> dict | None:
             continue
         try:
             data = m[key][str(weekday)][str(slot)]
+            data = dict(data)  # نسخة لتجنب التعديل على الأصل
             data["source"] = key
             data["weekday"] = weekday
             data["slot"] = slot
