@@ -5,6 +5,8 @@ Smart Analyst — رأي المحلل + المصفوفة الإحصائية.
 - تفسير اتجاه المصفوفة (احتمال صعود/هبوط)
 - إشعارات التغيرات المفاجئة
 - الدرجة المركبة + سياق اليوم + أوزان ديناميكية
+- توقع متعدد الآفاق (30د، ساعة، ساعتان)
+- أهداف الربح + احتمالية الانعكاس
 """
 import os
 import threading
@@ -138,21 +140,23 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
     - الإجراء
     - ثقة الإشارة
     - توافق المصفوفة (الدرجة المركبة)
-    - سياق اليوم
     - القرار النهائي
+    - توقع ساعة + هدف + انعكاس
+    - سياق اليوم
+    - تفاصيل (اختياري)
     """
     action = _action_text(state, symbol)
     if not action:
         return None
 
-    # ✅ النظام الجديد: final_confidence(signal_conf, symbol, direction) → dict
+    # النظام الجديد
     result = final_confidence(signal_conf, symbol, direction)
 
     lines = [action]
     lines.append(f"🎯 ثقة الإشارة: <b>{signal_conf}%</b>")
 
     if result.get("available"):
-        # تحذير إذا المصدر __combined__
+        # تحذير المصدر
         source = result.get("source", "?")
         if source == "__combined__":
             lines.append(f"⚠️ <i>لا توجد بيانات {_short(symbol)} — متوسط السوق</i>")
@@ -166,11 +170,24 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
         )
         lines.append(f"⚡ <b>القرار النهائي: {result['final']}%</b>")
 
-        # تحذير إذا الدرجة المركبة منخفضة
+        # ✨ توقع المدى المتوسط
+        forecast = result.get("forecast")
+        if forecast and forecast.get("available"):
+            h1 = forecast["horizons"]["1h"]
+            lines.append(
+                f"🔮 توقع ساعة: <b>{h1['expected']:+.3f}%</b> "
+                f"(نجاح {h1['window_wr']:.0f}%)"
+            )
+            lines.append(
+                f"🎯 هدف +0.5%: <b>{forecast['target_hit_0_5']:.0f}%</b> | "
+                f"انعكاس: {forecast['reversal_prob']:.0f}%"
+            )
+
+        # تحذير إذا التوافق منخفض
         if result["composite_adjusted"] < 45:
             lines.append("🚨 <b>تحذير: المصفوفة لا تدعم الإشارة!</b>")
 
-        # سياق اليوم (فقط إذا ليس محايداً)
+        # سياق اليوم
         day_ctx = result.get("day_ctx")
         if day_ctx and day_ctx.get("bias") != "neutral":
             lines.append(
@@ -183,15 +200,39 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
             raw = result.get("raw", {})
             lines.append("")
             lines.append("<i>📈 تفصيل:</i>")
-            lines.append(f"<i>• WR: {raw.get('wr', 0)}% | RET: {raw.get('ret', 0):+.4f}%</i>")
-            lines.append(f"<i>• t: {raw.get('t', 0):+.3f} | n: {raw.get('n', 0)}</i>")
+            lines.append(
+                f"<i>• WR: {raw.get('wr', 0)}% | RET: {raw.get('ret', 0):+.4f}%</i>"
+            )
+            lines.append(
+                f"<i>• t: {raw.get('t', 0):+.3f} | n: {raw.get('n', 0)}</i>"
+            )
+            lines.append(
+                f"<i>• cum4: {raw.get('cum_ret_4', 0):+.4f}% | "
+                f"MFE4: {raw.get('mfe_4', 0):+.4f}% | "
+                f"MAE4: {raw.get('mae_4', 0):+.4f}%</i>"
+            )
             lines.append(
                 f"<i>• أوزان: إشارة {result['weight_signal']} | "
                 f"مصفوفة {result['weight_matrix']}</i>"
             )
+            hb = result.get("horizon_bonus", 0)
+            if hb != 0:
+                sign = "+" if hb > 0 else ""
+                lines.append(f"<i>• مكافأة الأفق: {sign}{hb}</i>")
             if result.get("day_bonus", 0) != 0:
                 sign = "+" if result["day_bonus"] > 0 else ""
                 lines.append(f"<i>• مكافأة اليوم: {sign}{result['day_bonus']}</i>")
+            if forecast and forecast.get("available"):
+                h30 = forecast["horizons"]["30m"]
+                h2 = forecast["horizons"]["2h"]
+                lines.append(
+                    f"<i>• 30د: {h30['expected']:+.3f}% | "
+                    f"2س: {h2['expected']:+.3f}%</i>"
+                )
+                lines.append(
+                    f"<i>• هدف +1%: {forecast['target_hit_1_0']:.0f}% | "
+                    f"هدف +2%: {forecast['target_hit_2_0']:.0f}%</i>"
+                )
     else:
         reason = result.get("reason", "لا توجد بيانات")
         lines.append(f"📊 المصفوفة: <i>{reason}</i>")
@@ -221,12 +262,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🧠 <b>رأي المحلل + المصفوفة</b>\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
-        "رسائل مختصرة:\n"
-        "• الإجراء (اشتر/بع) — مع اتجاه واضح\n"
+        "الرسائل تحتوي:\n"
+        "• الإجراء (اشتر/بع)\n"
         "• ثقة الإشارة\n"
         "• توافق المصفوفة (احتمال صعود/هبوط)\n"
-        "• سياق اليوم\n"
-        "• القرار النهائي\n\n"
+        "• القرار النهائي\n"
+        "• توقع ساعة + هدف + انعكاس\n"
+        "• سياق اليوم\n\n"
         f"📌 <b>Chat ID:</b> <code>{cid}</code>\n\n"
         "<b>الأوامر:</b>\n"
         "/now — فحص فوري (كل العملات)\n"
@@ -318,6 +360,10 @@ async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) سياق اليوم
     day_ctx = day_context(sym, dt=now)
 
+    # 4) توقع متعدد الآفاق (LONG للعرض)
+    fc = final_confidence(0, sym, "LONG", dt=now)
+    forecast = fc.get("forecast") if fc.get("available") else None
+
     text = (
         f"📊 <b>{sym}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -340,7 +386,19 @@ async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += (
             f"\n<b>سياق اليوم ({day_ctx['day_name']}):</b>\n"
             f"{day_ctx['emoji']} {day_ctx['bias']} "
-            f"(WR={day_ctx['avg_wr']}%, RET={day_ctx['avg_ret']:+.4f}%)\n"
+            f"(WR={day_ctx['avg_wr']}%)\n"
+        )
+
+    if forecast and forecast.get("available"):
+        h1 = forecast["horizons"]["1h"]
+        h2 = forecast["horizons"]["2h"]
+        text += (
+            f"\n<b>توقع متعدد الآفاق:</b>\n"
+            f"• ساعة: {h1['expected']:+.3f}% (نجاح {h1['window_wr']:.0f}%)\n"
+            f"• ساعتان: {h2['expected']:+.3f}% (نجاح {h2['window_wr']:.0f}%)\n"
+            f"• هدف +0.5%: {forecast['target_hit_0_5']:.0f}%\n"
+            f"• هدف +1.0%: {forecast['target_hit_1_0']:.0f}%\n"
+            f"• انعكاس: {forecast['reversal_prob']:.0f}%\n"
         )
 
     text += (
@@ -374,14 +432,17 @@ async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # رسالة غنية من matrix
     msg = format_matrix_message(sym, result)
 
-    # Telegram: عرض داخل <pre> للحفاظ على التنسيق
-    await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
+    # Telegram: عرض داخل <pre>
+    # نشذّب بعض الرموز غير المدعومة داخل <pre>
+    safe = msg.replace("<", "&lt;").replace(">", "&gt;")
+    await update.message.reply_text(f"<pre>{safe}</pre>", parse_mode="HTML")
 
 
 async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """تشخيص المصفوفة"""
     debug = debug_matrix("BTC/USDT")
-    await update.message.reply_text(f"<code>{debug}</code>", parse_mode="HTML")
+    safe = debug.replace("<", "&lt;").replace(">", "&gt;")
+    await update.message.reply_text(f"<code>{safe}</code>", parse_mode="HTML")
 
 
 # ============================================================
