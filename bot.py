@@ -11,6 +11,27 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from supabase import create_client
 
 from matrix import agreement_score, final_confidence
+import logging
+from telegram.error import NetworkError, TimedOut
+
+# ===== Logging =====
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
+async def error_handler(update, context):
+    """معالج أخطاء — يتجاهل أخطاء الشبكة"""
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"⚠️ network: {err}")
+        return
+    logger.error(f"❌ error: {err}", exc_info=err)
 
 load_dotenv()
 
@@ -336,6 +357,7 @@ def _run_health():
 # ============================================================
 # Main
 # ============================================================
+
 def main():
     threading.Thread(target=_run_health, daemon=True).start()
     print("🧠 Analyst Bot + Matrix يبدأ...")
@@ -346,6 +368,7 @@ def main():
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("sym", cmd_symbol))
     app.add_handler(CommandHandler("matrix", cmd_matrix))
+    app.add_error_handler(error_handler)  # ← جديد
 
     if app.job_queue:
         app.job_queue.run_repeating(
@@ -354,12 +377,22 @@ def main():
         app.job_queue.run_repeating(
             alert_job, interval=ALERT_MIN * 60, first=30, name="alerts"
         )
-        print(f"⏰ كل {HOURLY_MIN} دقيقة: رسائل مختصرة")
-        print(f"⚡ كل {ALERT_MIN} دقائق: تغيرات مفاجئة")
+        print(f"⏰ كل {HOURLY_MIN} دقيقة")
+        print(f"⚡ كل {ALERT_MIN} دقائق")
 
     print("✅ Bot جاهز")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        bootstrap_retries=5,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    main()    
+
