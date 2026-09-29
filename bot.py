@@ -2,12 +2,14 @@
 matrix_engine.py
 ================
 محرك المصفوفة الزمنية (15min) لدعم قرارات التداول
-- تحميل المصفوفة + تطبيع البنية
+
+المزايا:
+- تحميل المصفوفة + تطبيع البنية (مفاتيح أيام عربية → 0-6)
 - درجة مركبة تستخدم كل الحقول (wr, ret, t, n)
 - سياق اليوم (Day Strength Indicator)
-- وزن ديناميكي حسب |t|
-- تحديد الحالة (state) ورسالة العمل (action)
-- رسالة غنية للبوت
+- وزن ديناميكي حسب قوة |t|
+- تحديد الحالة (state) ونص العمل (_action_text)
+- تحذيرات ذكية + رسالة غنية للبوت
 """
 
 import json
@@ -38,17 +40,16 @@ ARABIC_DAY_NAMES = {
 
 # أوزان الدرجة المركبة (قابلة للتعديل)
 COMPOSITE_WEIGHTS = {
-    "wr": 0.35,
-    "ret": 0.25,
-    "t": 0.25,
-    "n": 0.15,
+    "wr": 0.35,    # معدل الفوز
+    "ret": 0.25,   # العائد المتوقع
+    "t": 0.25,     # الثقة الإحصائية
+    "n": 0.15,     # كفاية العينة
 }
 
 # عتبات تحديد الحالة (state) بناءً على الثقة النهائية
-# يمكن تعديلها حسب استراتيجيتك
 STATE_THRESHOLDS = {
     "STRONG": 85,   # ثقة عالية جداً
-    "EARLY": 72,    # ثقة متوسطة → فرصة مبكرة
+    "EARLY": 72,    # فرصة مبكرة
     "MIN": 60,      # الحد الأدنى للدخول
 }
 
@@ -88,6 +89,7 @@ def _load() -> dict:
 
 
 def _normalize(raw: dict) -> dict:
+    """يوحّد البنية إلى: { 'BTC': { '0': {slot: {...}} }, '__combined__': {...} }"""
     normalized = {}
 
     if "generated_at" in raw:
@@ -114,6 +116,7 @@ def _normalize_symbol(data) -> dict:
 
     result = {}
 
+    # البنية الفعلية: {"days": [{"day": ..., "slots": [...]}, ...]}
     if "days" in data and isinstance(data["days"], list):
         for day_obj in data["days"]:
             if not isinstance(day_obj, dict):
@@ -128,6 +131,7 @@ def _normalize_symbol(data) -> dict:
                 result[str(day_num)] = _normalize_slots(slots_list)
         return result
 
+    # البنية القديمة: {"الإثنين": {...}, ...}
     for day_key, slots_data in data.items():
         if str(day_key).startswith("_"):
             continue
@@ -180,6 +184,7 @@ def _normalize_slots_list(data: list) -> dict:
 
 
 def _normalize_row(row: dict) -> dict:
+    """يوحّد حقول الصف: wr, ar (avg_return), n, t"""
     return {
         "wr": float(row.get("win_rate", row.get("wr", 0))),
         "ar": float(row.get("avg_return", row.get("ret", row.get("ar", 0)))),
@@ -192,6 +197,7 @@ def _normalize_row(row: dict) -> dict:
 # 3) جلب بيانات السلوت
 # ============================================================
 def get_matrix_stats(symbol: str, dt: Optional[datetime] = None) -> Optional[dict]:
+    """يجلب إحصائيات السلوت الحالي للرمز (مع fallback إلى __combined__)"""
     m = _load()
     if not m:
         return None
@@ -219,13 +225,15 @@ def get_matrix_stats(symbol: str, dt: Optional[datetime] = None) -> Optional[dic
 
 
 # ============================================================
-# 4) الدرجة المركبة
+# 4) الدرجة المركبة (Composite Score)
 # ============================================================
 def _wr_score(wr: float, direction: str) -> float:
+    """درجة معدل الفوز (0-100) حسب الاتجاه"""
     return wr if direction.upper() == "LONG" else (100 - wr)
 
 
 def _ret_score(ret: float, direction: str) -> float:
+    """درجة العائد (0-100): +1% → 100، -1% → 0"""
     if direction.upper() == "LONG":
         score = 50 + (ret * 50)
     else:
@@ -234,8 +242,10 @@ def _ret_score(ret: float, direction: str) -> float:
 
 
 def _t_score(t: float, direction: str) -> float:
+    """درجة الثقة الإحصائية (0-100) مع مراعاة اتجاه t"""
     t_abs = abs(t)
     score = min(100.0, (t_abs / 3.0) * 100)
+
     correct = (t > 0 and direction.upper() == "LONG") or \
               (t < 0 and direction.upper() == "SHORT")
     if not correct:
@@ -244,6 +254,7 @@ def _t_score(t: float, direction: str) -> float:
 
 
 def _n_score(n: int) -> float:
+    """درجة كفاية العينة (0-100): n>=30 → 100، n<10 → 0"""
     if n >= 30:
         return 100.0
     if n < 10:
@@ -253,6 +264,9 @@ def _n_score(n: int) -> float:
 
 def matrix_composite_score(symbol: str, direction: str,
                            dt: Optional[datetime] = None) -> Optional[dict]:
+    """
+    يحسب درجة مركبة (0-100) تستخدم كل حقول المصفوفة: wr + ret + t + n
+    """
     stats = get_matrix_stats(symbol, dt)
     if not stats:
         return None
@@ -288,10 +302,14 @@ def matrix_composite_score(symbol: str, direction: str,
 
 
 # ============================================================
-# 5) سياق اليوم
+# 5) سياق اليوم (Day Strength)
 # ============================================================
 def day_context(symbol: str, weekday: Optional[int] = None,
                 dt: Optional[datetime] = None) -> Optional[dict]:
+    """
+    يحسب متوسط سلوك اليوم كاملاً (كل الـ 96 سلوت)
+    ليعطينا صورة عن 'مزاج' اليوم
+    """
     m = _load()
     if not m:
         return None
@@ -337,6 +355,7 @@ def day_context(symbol: str, weekday: Optional[int] = None,
 
 
 def _day_bonus(day_ctx: Optional[dict], direction: str) -> int:
+    """مكافأة/عقوبة للدرجة المركبة حسب توافق سياق اليوم مع الاتجاه"""
     if not day_ctx:
         return 0
     bias = day_ctx["bias"]
@@ -357,6 +376,7 @@ def _day_bonus(day_ctx: Optional[dict], direction: str) -> int:
 # 6) الثقة النهائية
 # ============================================================
 def _dynamic_weight(t_abs: float) -> float:
+    """وزن المصفوفة بناءً على قوة t-statistic"""
     if t_abs >= 3.0:
         return 0.50
     if t_abs >= 2.0:
@@ -369,6 +389,9 @@ def _dynamic_weight(t_abs: float) -> float:
 def agreement_score(symbol: str, direction: str,
                     dt: Optional[datetime] = None,
                     min_samples: int = 10) -> dict:
+    """
+    يحسب اتفاق المصفوفة (نسخة مبسطة متوافقة مع الإصدار السابق)
+    """
     stats = get_matrix_stats(symbol, dt)
     if not stats:
         return {
@@ -405,15 +428,26 @@ def final_confidence(signal_conf: int, symbol: str, direction: str,
                      dt: Optional[datetime] = None,
                      min_samples: int = 10,
                      use_day_context: bool = True) -> dict:
+    """
+    يحسب الثقة النهائية بنظام متكامل:
+      1. الدرجة المركبة (wr + ret + t + n)
+      2. مكافأة/عقوبة من سياق اليوم
+      3. وزن ديناميكي حسب |t|
+
+    يعيد dict غنياً يحتوي كل التفاصيل لبناء رسالة البوت.
+    """
     stats = get_matrix_stats(symbol, dt)
 
+    # حالة عدم توفر بيانات
     if not stats:
         return {
             "final": signal_conf,
             "available": False,
             "reason": "السلوت غير موجود في المصفوفة",
-            "composite": None, "day_ctx": None,
-            "weight_matrix": 0.0, "weight_signal": 1.0,
+            "composite": None,
+            "day_ctx": None,
+            "weight_matrix": 0.0,
+            "weight_signal": 1.0,
             "direction": direction.upper(),
             "signal_conf": signal_conf,
         }
@@ -423,26 +457,32 @@ def final_confidence(signal_conf: int, symbol: str, direction: str,
             "final": signal_conf,
             "available": False,
             "reason": f"عينة صغيرة (n={stats['n']})",
-            "composite": None, "day_ctx": None,
-            "weight_matrix": 0.0, "weight_signal": 1.0,
+            "composite": None,
+            "day_ctx": None,
+            "weight_matrix": 0.0,
+            "weight_signal": 1.0,
             "direction": direction.upper(),
             "signal_conf": signal_conf,
         }
 
+    # 1) الدرجة المركبة
     comp_result = matrix_composite_score(symbol, direction, dt)
     if not comp_result:
         return {
             "final": signal_conf,
             "available": False,
             "reason": "فشل حساب الدرجة المركبة",
-            "composite": None, "day_ctx": None,
-            "weight_matrix": 0.0, "weight_signal": 1.0,
+            "composite": None,
+            "day_ctx": None,
+            "weight_matrix": 0.0,
+            "weight_signal": 1.0,
             "direction": direction.upper(),
             "signal_conf": signal_conf,
         }
 
     composite = comp_result["composite"]
 
+    # 2) سياق اليوم
     day_ctx = None
     bonus = 0
     if use_day_context:
@@ -451,10 +491,12 @@ def final_confidence(signal_conf: int, symbol: str, direction: str,
 
     adjusted_composite = max(0.0, min(100.0, composite + bonus))
 
+    # 3) الوزن الديناميكي
     t_abs = abs(comp_result["raw"]["t"])
     weight_matrix = _dynamic_weight(t_abs)
     weight_signal = 1.0 - weight_matrix
 
+    # 4) الدمج النهائي
     final = (signal_conf * weight_signal) + (adjusted_composite * weight_matrix)
     final = int(round(final))
 
@@ -463,6 +505,7 @@ def final_confidence(signal_conf: int, symbol: str, direction: str,
         "available": True,
         "direction": direction.upper(),
         "signal_conf": signal_conf,
+        # الدرجة المركبة
         "composite": composite,
         "composite_adjusted": round(adjusted_composite, 1),
         "day_bonus": bonus,
@@ -470,9 +513,12 @@ def final_confidence(signal_conf: int, symbol: str, direction: str,
         "ret_score": comp_result["ret_score"],
         "t_score": comp_result["t_score"],
         "n_score": comp_result["n_score"],
+        # البيانات الخام
         "raw": comp_result["raw"],
+        # الأوزان
         "weight_matrix": round(weight_matrix, 2),
         "weight_signal": round(weight_signal, 2),
+        # السياق
         "day_ctx": day_ctx,
         "source": comp_result["source"],
         "weekday": comp_result["weekday"],
@@ -548,6 +594,7 @@ def _action_text(state: str, symbol: str) -> str | None:
 # 8) التحذيرات الذكية
 # ============================================================
 def build_warnings(result: dict) -> list[str]:
+    """يبني قائمة تحذيرات بناءً على نتيجة final_confidence"""
     warnings = []
     if not result.get("available"):
         return warnings
@@ -570,9 +617,9 @@ def build_warnings(result: dict) -> list[str]:
         warnings.append(f"✅ ثقة إحصائية قوية (t={t}, {sign})")
 
     if wr > 55 and ret < -0.05:
-        warnings.append("⚠️ تعارض: WR مرتفع لكن العائد سلبي")
+        warnings.append("⚠️ تعارض: WR مرتفع لكن العائد سلبي (خسائر كبيرة محتملة)")
     if wr < 45 and ret > 0.05:
-        warnings.append("⚠️ تعارض: WR منخفض لكن العائد موجب")
+        warnings.append("⚠️ تعارض: WR منخفض لكن العائد موجب (مكاسب كبيرة محتملة)")
 
     if direction == "LONG" and ret < -0.05:
         warnings.append("⚠️ العائد التاريخي سالب — يخالف اتجاه LONG")
@@ -614,7 +661,7 @@ def format_matrix_message(symbol: str, result: dict,
     lines.append(f"🕐 {dt.strftime('%Y-%m-%d %H:%M')} UTC")
     lines.append("━" * 30)
 
-    # نص العمل (Action) — هذا هو الهدف الأساسي
+    # نص العمل
     if include_action:
         state = _state_from_confidence(
             result["final"], direction, result.get("available", True)
@@ -764,7 +811,7 @@ def debug_matrix(symbol: str, dt: Optional[datetime] = None) -> str:
 
 
 # ============================================================
-# 11) مثال استخدام كامل
+# 11) مثال استخدام
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
