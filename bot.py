@@ -4,6 +4,7 @@ Smart Analyst — رأي المحلل + المصفوفة الإحصائية.
 - EARLY BUY / EARLY SELL
 - تفسير اتجاه المصفوفة (احتمال صعود/هبوط)
 - إشعارات التغيرات المفاجئة
+- الدرجة المركبة + سياق اليوم + أوزان ديناميكية
 """
 import os
 import threading
@@ -16,7 +17,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import NetworkError, TimedOut
 from supabase import create_client
 
-from matrix import agreement_score, final_confidence, debug_matrix
+from matrix import (
+    agreement_score,
+    final_confidence,
+    matrix_composite_score,
+    day_context,
+    debug_matrix,
+    format_matrix_message,
+)
 
 load_dotenv()
 
@@ -97,7 +105,6 @@ def _action_text(state: str, symbol: str) -> str | None:
     """نص الإجراء المختصر — مع اتجاه واضح"""
     s = _short(symbol)
 
-    # BUY / EARLY BUY
     if "STRONG BUY" in state:
         return f"🟢🔥 اشتر بقوة {s}"
     if "EARLY BUY" in state:
@@ -105,7 +112,6 @@ def _action_text(state: str, symbol: str) -> str | None:
     if "BUY" in state:
         return f"🟢 اشتر {s}"
 
-    # SELL / EARLY SELL
     if "STRONG SELL" in state:
         return f"🔴🔥 بع بقوة {s}"
     if "EARLY SELL" in state:
@@ -131,47 +137,63 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
     رسالة مختصرة:
     - الإجراء
     - ثقة الإشارة
-    - توافق المصفوفة (مع تفسير الاتجاه)
+    - توافق المصفوفة (الدرجة المركبة)
+    - سياق اليوم
     - القرار النهائي
     """
     action = _action_text(state, symbol)
     if not action:
         return None
 
-    m = agreement_score(symbol, direction)
-
-    # القرار النهائي
-    if m["available"]:
-        final = final_confidence(signal_conf, m["agreement"], direction)
-    else:
-        final = signal_conf
+    # ✅ النظام الجديد: final_confidence(signal_conf, symbol, direction) → dict
+    result = final_confidence(signal_conf, symbol, direction)
 
     lines = [action]
     lines.append(f"🎯 ثقة الإشارة: <b>{signal_conf}%</b>")
 
-    if m["available"]:
-        # ⚠️ تفسير الاتجاه
-        is_buy = _is_buy_state(state)
-        direction_label = "احتمال صعود" if is_buy else "احتمال هبوط"
-
-        # ⚠️ تحذير إذا المصدر __combined__
-        source = m.get("source", "?")
+    if result.get("available"):
+        # تحذير إذا المصدر __combined__
+        source = result.get("source", "?")
         if source == "__combined__":
             lines.append(f"⚠️ <i>لا توجد بيانات {_short(symbol)} — متوسط السوق</i>")
 
-        lines.append(f"📊 توافق المصفوفة: <b>{m['agreement']}%</b> ({direction_label})")
-        lines.append(f"⚡ <b>القرار النهائي: {final}%</b>")
+        # اتجاه المصفوفة
+        is_buy = _is_buy_state(state)
+        direction_label = "احتمال صعود" if is_buy else "احتمال هبوط"
 
-        # ⚠️ تحذير إذا التوافق منخفض
-        if m["agreement"] < 45:
-            lines.append(f"🚨 <b>تحذير: المصفوفة لا تدعم الإشارة!</b>")
+        lines.append(
+            f"📊 توافق المصفوفة: <b>{result['composite_adjusted']}%</b> ({direction_label})"
+        )
+        lines.append(f"⚡ <b>القرار النهائي: {result['final']}%</b>")
 
+        # تحذير إذا الدرجة المركبة منخفضة
+        if result["composite_adjusted"] < 45:
+            lines.append("🚨 <b>تحذير: المصفوفة لا تدعم الإشارة!</b>")
+
+        # سياق اليوم (فقط إذا ليس محايداً)
+        day_ctx = result.get("day_ctx")
+        if day_ctx and day_ctx.get("bias") != "neutral":
+            lines.append(
+                f"{day_ctx['emoji']} سياق اليوم ({day_ctx['day_name']}): "
+                f"<i>{day_ctx['bias']}</i>"
+            )
+
+        # تفاصيل كاملة
         if full_details:
+            raw = result.get("raw", {})
             lines.append("")
-            lines.append(f"<i>عينة: {m['n']} | مصدر: {m.get('source', '?')} | "
-                         f"t={m['t_stat']} | WR={m['win_rate']}%</i>")
+            lines.append("<i>📈 تفصيل:</i>")
+            lines.append(f"<i>• WR: {raw.get('wr', 0)}% | RET: {raw.get('ret', 0):+.4f}%</i>")
+            lines.append(f"<i>• t: {raw.get('t', 0):+.3f} | n: {raw.get('n', 0)}</i>")
+            lines.append(
+                f"<i>• أوزان: إشارة {result['weight_signal']} | "
+                f"مصفوفة {result['weight_matrix']}</i>"
+            )
+            if result.get("day_bonus", 0) != 0:
+                sign = "+" if result["day_bonus"] > 0 else ""
+                lines.append(f"<i>• مكافأة اليوم: {sign}{result['day_bonus']}</i>")
     else:
-        reason = m.get("reason", "لا توجد بيانات")
+        reason = result.get("reason", "لا توجد بيانات")
         lines.append(f"📊 المصفوفة: <i>{reason}</i>")
         lines.append(f"⚡ <b>القرار النهائي: {signal_conf}%</b>")
 
@@ -203,12 +225,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• الإجراء (اشتر/بع) — مع اتجاه واضح\n"
         "• ثقة الإشارة\n"
         "• توافق المصفوفة (احتمال صعود/هبوط)\n"
+        "• سياق اليوم\n"
         "• القرار النهائي\n\n"
         f"📌 <b>Chat ID:</b> <code>{cid}</code>\n\n"
         "<b>الأوامر:</b>\n"
         "/now — فحص فوري (كل العملات)\n"
         "/sym BTC/USDT — رمز محدد\n"
         "/matrix BTC — إحصاء المصفوفة\n"
+        "/full BTC — تقرير غني كامل\n"
         "/raw — تشخيص المصفوفة"
     )
     await update.message.reply_text(text, parse_mode="HTML")
@@ -264,13 +288,15 @@ async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعرض إحصائيات المصفوفة"""
+    """يعرض إحصائيات المصفوفة + الدرجة المركبة + سياق اليوم"""
     sym = "BTC/USDT"
     if context.args:
         s = context.args[0].upper()
         sym = s if "/" in s else s + "/USDT"
 
     now = datetime.now(timezone.utc)
+
+    # 1) اتفاق بسيط (البيانات الخام)
     m = agreement_score(sym, "LONG", now)
 
     if not m["available"]:
@@ -285,19 +311,71 @@ async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="HTML")
         return
 
+    # 2) الدرجة المركبة للاتجاهين
+    comp_long = matrix_composite_score(sym, "LONG", now)
+    comp_short = matrix_composite_score(sym, "SHORT", now)
+
+    # 3) سياق اليوم
+    day_ctx = day_context(sym, dt=now)
+
     text = (
         f"📊 <b>{sym}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>البيانات الخام:</b>\n"
         f"• Win Rate: <b>{m['win_rate']}%</b>\n"
-        f"• متوسط العائد: {m['avg_return']}%\n"
+        f"• متوسط العائد: {m['avg_return']:+.4f}%\n"
         f"• العينة: {m['n']} صفقة\n"
-        f"• t-stat: {m['t_stat']}\n"
-        f"• المصدر: {m['source']}\n\n"
-        f"<i>تفسير:</i>\n"
+        f"• t-stat: {m['t_stat']:+.3f}\n"
+        f"• المصدر: {m['source']}\n"
+    )
+
+    if comp_long and comp_short:
+        text += (
+            f"\n<b>الدرجة المركبة:</b>\n"
+            f"• 🟢 LONG: <b>{comp_long['composite']}%</b>\n"
+            f"• 🔴 SHORT: <b>{comp_short['composite']}%</b>\n"
+        )
+
+    if day_ctx:
+        text += (
+            f"\n<b>سياق اليوم ({day_ctx['day_name']}):</b>\n"
+            f"{day_ctx['emoji']} {day_ctx['bias']} "
+            f"(WR={day_ctx['avg_wr']}%, RET={day_ctx['avg_ret']:+.4f}%)\n"
+        )
+
+    text += (
+        f"\n<i>تفسير:</i>\n"
         f"• LONG → {m['win_rate']}% (احتمال صعود)\n"
         f"• SHORT → {round(100 - m['win_rate'], 1)}% (احتمال هبوط)"
     )
+
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تقرير غني كامل للمصفوفة"""
+    sym = "BTC/USDT"
+    if context.args:
+        s = context.args[0].upper()
+        sym = s if "/" in s else s + "/USDT"
+
+    snap = get_latest_snapshot(sym)
+    if not snap:
+        await update.message.reply_text(f"❌ لا توجد بيانات لـ {sym}")
+        return
+
+    state = snap.get("state", "NO TRADE")
+    conf = _confidence(snap)
+    direction = "LONG" if _is_buy_state(state) else "SHORT"
+
+    # نتيجة كاملة
+    result = final_confidence(conf, sym, direction)
+
+    # رسالة غنية من matrix
+    msg = format_matrix_message(sym, result)
+
+    # Telegram: عرض داخل <pre> للحفاظ على التنسيق
+    await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
 
 
 async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -427,6 +505,7 @@ def main():
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("sym", cmd_symbol))
     app.add_handler(CommandHandler("matrix", cmd_matrix))
+    app.add_handler(CommandHandler("full", cmd_full))
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_error_handler(error_handler)
 
