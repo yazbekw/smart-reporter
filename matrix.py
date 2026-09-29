@@ -1,6 +1,5 @@
 """
-تحميل المصفوفة + تطبيع البنية + البحث.
-يدعم كل البنيات المحتملة.
+تحميل المصفوفة + تطبيع البنية (مفاتيح أيام عربية → 0-6).
 """
 import json
 from pathlib import Path
@@ -9,10 +8,18 @@ from datetime import datetime, timezone
 MATRIX_PATH = Path(__file__).resolve().parent / "matrix_15min.json"
 _matrix = None
 
+# خريطة الأيام العربية → رقم (Python weekday)
+ARABIC_DAYS = {
+    "الإثنين": 0, "الاثنين": 0, "Monday": 0,
+    "الثلاثاء": 1, "Tuesday": 1,
+    "الأربعاء": 2, "الاربعاء": 2, "Wednesday": 2,
+    "الخميس": 3, "Thursday": 3,
+    "الجمعة": 4, "Friday": 4,
+    "السبت": 5, "Saturday": 5,
+    "الأحد": 6, "الاحد": 6, "Sunday": 6,
+}
 
-# ============================================================
-# التحميل والتطبيع
-# ============================================================
+
 def _load():
     global _matrix
     if _matrix is not None:
@@ -32,66 +39,79 @@ def _load():
 
 
 def _normalize(raw: dict) -> dict:
+    """يوحّد البنية إلى: { 'BTC': { '0': {slot: {...}} }, '__combined__': {...} }"""
     normalized = {}
 
-    # الميتا
-    for meta in ["generated_at", "days_back"]:
-        if meta in raw:
-            normalized[f"_meta_{meta}"] = raw[meta]
+    if "generated_at" in raw:
+        normalized["_meta_generated_at"] = raw["generated_at"]
+    if "days_back" in raw:
+        normalized["_meta_days_back"] = raw["days_back"]
 
-    # مصدر الرموز
-    source = raw
-    if "symbols" in raw and isinstance(raw["symbols"], dict):
-        source = raw["symbols"]
-
-    # combined
+    # ===== combined =====
     if "combined" in raw and isinstance(raw["combined"], dict):
-        normalized["__combined__"] = _normalize_symbol_data(raw["combined"])
-    elif "__combined__" in source:
-        normalized["__combined__"] = _normalize_symbol_data(source["__combined__"])
+        normalized["__combined__"] = _normalize_symbol(raw["combined"])
 
-    # الرموز
-    for sym, data in source.items():
-        if sym.startswith("_"):
-            continue
-        normalized[sym.upper()] = _normalize_symbol_data(data)
+    # ===== symbols =====
+    source = raw.get("symbols", {})
+    if isinstance(source, dict):
+        for sym, data in source.items():
+            if sym.startswith("_"):
+                continue
+            normalized[sym.upper()] = _normalize_symbol(data)
 
     return normalized
 
 
-def _normalize_symbol_data(data) -> dict:
-    if isinstance(data, dict):
-        if _looks_like_weekday_dict(data):
-            return _normalize_weekday_dict(data)
-        if "days" in data and isinstance(data["days"], dict):
-            return _normalize_weekday_dict(data["days"])
-        return data
-    if isinstance(data, list):
-        return _normalize_list_of_rows(data)
-    return {}
+def _normalize_symbol(data) -> dict:
+    """
+    يحوّل:
+      { "الإثنين": { "0": {...}, ... }, "الثلاثاء": {...} }
+    إلى:
+      { "0": { "0": {...}, "1": {...} }, "1": {...} }
+    """
+    if not isinstance(data, dict):
+        return {}
 
-
-def _looks_like_weekday_dict(data: dict) -> bool:
-    keys = [k for k in data.keys() if not str(k).startswith("_")]
-    if not keys:
-        return False
-    day_keys = [k for k in keys if str(k).isdigit() and 0 <= int(k) <= 6]
-    return len(day_keys) >= 3
-
-
-def _normalize_weekday_dict(data: dict) -> dict:
     result = {}
-    for wd_key, slots_data in data.items():
-        if str(wd_key).startswith("_") or not str(wd_key).isdigit():
+    for day_key, slots_data in data.items():
+        if str(day_key).startswith("_"):
             continue
+
+        # حوّل اليوم إلى رقم
+        day_num = _day_to_num(day_key)
+        if day_num is None:
+            continue
+
         if isinstance(slots_data, dict):
-            result[str(wd_key)] = _normalize_slots_dict(slots_data)
+            result[str(day_num)] = _normalize_slots(slots_data)
         elif isinstance(slots_data, list):
-            result[str(wd_key)] = _normalize_slots_list(slots_data)
+            result[str(day_num)] = _normalize_slots_list(slots_data)
+
     return result
 
 
-def _normalize_slots_dict(data: dict) -> dict:
+def _day_to_num(day_key) -> int | None:
+    """يحوّل مفتاح اليوم إلى 0-6"""
+    s = str(day_key).strip()
+
+    # رقم مباشر
+    if s.isdigit() and 0 <= int(s) <= 6:
+        return int(s)
+
+    # اسم عربي/إنجليزي
+    if s in ARABIC_DAYS:
+        return ARABIC_DAYS[s]
+
+    # بحث جزئي (احتياطي)
+    for name, num in ARABIC_DAYS.items():
+        if name in s or s in name:
+            return num
+
+    return None
+
+
+def _normalize_slots(data: dict) -> dict:
+    """يحوّل مفاتيح السلوت إلى أرقام نظيفة"""
     result = {}
     for k, v in data.items():
         k_str = str(k).replace("slot_", "").replace("slot", "").strip()
@@ -112,26 +132,10 @@ def _normalize_slots_list(data: list) -> dict:
     return result
 
 
-def _normalize_list_of_rows(data: list) -> dict:
-    result = {}
-    for row in data:
-        if not isinstance(row, dict):
-            continue
-        wd = row.get("weekday")
-        slot = row.get("slot")
-        if wd is None or slot is None:
-            continue
-        wd_str = str(int(wd))
-        slot_str = str(int(slot))
-        result.setdefault(wd_str, {})
-        result[wd_str][slot_str] = _normalize_row(row)
-    return result
-
-
 def _normalize_row(row: dict) -> dict:
     return {
         "wr": float(row.get("win_rate", row.get("wr", 0))),
-        "ar": float(row.get("avg_return", row.get("ar", 0))),
+        "ar": float(row.get("avg_return", row.get("ret", row.get("ar", 0)))),
         "n": int(row.get("n", 0)),
         "t": float(row.get("t_stat", row.get("t", 0))),
     }
@@ -247,19 +251,19 @@ def debug_matrix(symbol: str, dt: datetime | None = None) -> str:
     lines.append("")
 
     if sym in m:
-        days_available = list(m[sym].keys())
+        days_available = sorted(m[sym].keys(), key=lambda x: int(x))
         lines.append(f"📅 أيام {sym}: {days_available}")
         wd_key = str(weekday)
         if wd_key in m[sym]:
-            slots = list(m[sym][wd_key].keys())
-            lines.append(f"✅ يوم {wd_key} — {len(slots)} سلوت: {slots[:5]}...")
+            slots = sorted(m[sym][wd_key].keys(), key=lambda x: int(x))
+            lines.append(f"✅ يوم {wd_key} — {len(slots)} سلوت")
             if str(slot) in m[sym][wd_key]:
                 d = m[sym][wd_key][str(slot)]
-                lines.append(f"   البيانات: wr={d['wr']}%, n={d['n']}, t={d['t']}")
+                lines.append(f"   wr={d['wr']}%, n={d['n']}, t={d['t']}")
             else:
                 lines.append(f"   ⚠️ السلوت {slot} غير موجود")
         else:
-            lines.append(f"⚠️ يوم {weekday} غير موجود في {sym}")
+            lines.append(f"⚠️ يوم {weekday} غير موجود")
     else:
         lines.append(f"⚠️ {sym} غير موجود")
 
