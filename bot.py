@@ -1,46 +1,51 @@
 """
-Smart Analyst — رأي المحلل + المصفوفة الإحصائية.
-يدعم:
-- EARLY BUY / EARLY SELL
-- تفسير اتجاه المصفوفة (احتمال صعود/هبوط)
-- إشعارات التغيرات المفاجئة
-- الدرجة المركبة + سياق اليوم + أوزان ديناميكية
+Binance Monitor Bot — مراقبة صفقات Binance Futures + أوامر Telegram تفاعلية.
+يعمل على Web Service (يفتح منفذ PORT) + WebSocket للإشعارات الفورية.
 """
 import os
-import threading
+import sys
+import time
+import re
+import json
+import asyncio
 import logging
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
+from datetime import datetime, timezone
+
+from binance import AsyncClient, BinanceSocketManager
+from binance.exceptions import BinanceAPIException
 from telegram import Update
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import NetworkError, TimedOut
-from supabase import create_client
-
-from matrix import (
-    agreement_score,
-    final_confidence,
-    matrix_composite_score,
-    day_context,
-    debug_matrix,
-    format_matrix_message,
-)
+from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_REPORT_CHAT_ID")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# ============================================================
+# الإعدادات
+# ============================================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+REQUIRED = {
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "TELEGRAM_CHAT_ID": CHAT_ID_RAW,
+    "BINANCE_API_KEY": API_KEY,
+    "BINANCE_API_SECRET": API_SECRET,
+}
+missing = [k for k, v in REQUIRED.items() if not v]
+if missing:
+    print(f"❌ متغيرات ناقصة: {', '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
 
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
-           "XRP/USDT", "ADA/USDT", "AVAX/USDT", "DOGE/USDT"]
+CHAT_ID = int(CHAT_ID_RAW)
 
-HOURLY_MIN = 60
-ALERT_MIN = 5
-
+HOURLY_MIN = 60           # دورة التقرير كل ساعة
+WS_RECONNECT_DELAY = 10   # ثوانٍ قبل إعادة الاتصال بـ WebSocket
 
 # ============================================================
 # Logging
@@ -52,431 +57,29 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
+logging.getLogger("binance").setLevel(logging.WARNING)
+log = logging.getLogger(__name__)
 
+# ============================================================
+# حالة عامة
+# ============================================================
+binance_client: AsyncClient | None = None
+notifications_enabled = True
 
-async def error_handler(update, context):
-    """معالج أخطاء — يتجاهل أخطاء الشبكة"""
-    err = context.error
-    if isinstance(err, (NetworkError, TimedOut)):
-        logger.warning(f"⚠️ network: {err}")
-        return
-    logger.error(f"❌ error: {err}", exc_info=err)
+# كاش HTTP + كشف الحظر
+_http_cache: dict = {}
+_banned_until_ms: int = 0
 
 
 # ============================================================
-# Helpers
+# Health Server (ليعمل على Web Service)
 # ============================================================
-def _short(symbol: str) -> str:
-    """BTC/USDT → BTC"""
-    return symbol.split("/")[0].upper()
-
-
-def _confidence(snap: dict) -> int:
-    """ثقة الإشارة (0-100)"""
-    score = abs(snap.get("total_score", 0))
-    details = snap.get("details") or {}
-    regime = (details.get("regime") or {}).get("regime", "")
-
-    breakdown = [
-        snap.get("trend_score", 0),
-        snap.get("momentum_score", 0),
-        snap.get("volume_score", 0),
-        snap.get("orderflow_score", 0),
-        snap.get("structure_score", 0),
-        snap.get("context_score", 0),
-    ]
-
-    base = min(score * 3, 60)
-
-    regime_bonus = 0
-    if regime == "trending": regime_bonus = 20
-    elif regime == "ranging": regime_bonus = 5
-    elif regime == "high_vol": regime_bonus = -10
-
-    positive = sum(1 for b in breakdown if b > 2)
-    negative = sum(1 for b in breakdown if b < -2)
-    harmony = (positive - negative) * 5
-
-    return max(0, min(100, int(base + regime_bonus + harmony)))
-
-
-def _action_text(state: str, symbol: str) -> str | None:
-    """نص الإجراء المختصر — مع اتجاه واضح"""
-    s = _short(symbol)
-
-    if "STRONG BUY" in state:
-        return f"🟢🔥 اشتر بقوة {s}"
-    if "EARLY BUY" in state:
-        return f"🔵 فرصة شراء مبكرة — {s}"
-    if "BUY" in state:
-        return f"🟢 اشتر {s}"
-
-    if "STRONG SELL" in state:
-        return f"🔴🔥 بع بقوة {s}"
-    if "EARLY SELL" in state:
-        return f"🔵 فرصة بيع مبكرة — {s}"
-    if "SELL" in state:
-        return f"🔴 بع {s}"
-
-    return None
-
-
-def _is_buy_state(state: str) -> bool:
-    """هل الحالة اتجاهها شراء؟"""
-    return "BUY" in state
-
-
-# ============================================================
-# بناء الرسالة المختصرة
-# ============================================================
-def build_short_signal(symbol: str, state: str, signal_conf: int,
-                       direction: str = "LONG",
-                       full_details: bool = False) -> str | None:
-    """
-    رسالة مختصرة:
-    - الإجراء
-    - ثقة الإشارة
-    - توافق المصفوفة (الدرجة المركبة)
-    - سياق اليوم
-    - القرار النهائي
-    """
-    action = _action_text(state, symbol)
-    if not action:
-        return None
-
-    # ✅ النظام الجديد: final_confidence(signal_conf, symbol, direction) → dict
-    result = final_confidence(signal_conf, symbol, direction)
-
-    lines = [action]
-    lines.append(f"🎯 ثقة الإشارة: <b>{signal_conf}%</b>")
-
-    if result.get("available"):
-        # تحذير إذا المصدر __combined__
-        source = result.get("source", "?")
-        if source == "__combined__":
-            lines.append(f"⚠️ <i>لا توجد بيانات {_short(symbol)} — متوسط السوق</i>")
-
-        # اتجاه المصفوفة
-        is_buy = _is_buy_state(state)
-        direction_label = "احتمال صعود" if is_buy else "احتمال هبوط"
-
-        lines.append(
-            f"📊 توافق المصفوفة: <b>{result['composite_adjusted']}%</b> ({direction_label})"
-        )
-        lines.append(f"⚡ <b>القرار النهائي: {result['final']}%</b>")
-
-        # تحذير إذا الدرجة المركبة منخفضة
-        if result["composite_adjusted"] < 45:
-            lines.append("🚨 <b>تحذير: المصفوفة لا تدعم الإشارة!</b>")
-
-        # سياق اليوم (فقط إذا ليس محايداً)
-        day_ctx = result.get("day_ctx")
-        if day_ctx and day_ctx.get("bias") != "neutral":
-            lines.append(
-                f"{day_ctx['emoji']} سياق اليوم ({day_ctx['day_name']}): "
-                f"<i>{day_ctx['bias']}</i>"
-            )
-
-        # تفاصيل كاملة
-        if full_details:
-            raw = result.get("raw", {})
-            lines.append("")
-            lines.append("<i>📈 تفصيل:</i>")
-            lines.append(f"<i>• WR: {raw.get('wr', 0)}% | RET: {raw.get('ret', 0):+.4f}%</i>")
-            lines.append(f"<i>• t: {raw.get('t', 0):+.3f} | n: {raw.get('n', 0)}</i>")
-            lines.append(
-                f"<i>• أوزان: إشارة {result['weight_signal']} | "
-                f"مصفوفة {result['weight_matrix']}</i>"
-            )
-            if result.get("day_bonus", 0) != 0:
-                sign = "+" if result["day_bonus"] > 0 else ""
-                lines.append(f"<i>• مكافأة اليوم: {sign}{result['day_bonus']}</i>")
-    else:
-        reason = result.get("reason", "لا توجد بيانات")
-        lines.append(f"📊 المصفوفة: <i>{reason}</i>")
-        lines.append(f"⚡ <b>القرار النهائي: {signal_conf}%</b>")
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# الفحص الأساسي
-# ============================================================
-def get_latest_snapshot(symbol: str) -> dict | None:
-    res = (
-        supabase.table("snapshots").select("*")
-        .eq("symbol", symbol)
-        .order("timestamp", desc=True)
-        .limit(1).execute()
-    )
-    return res.data[0] if res.data else None
-
-
-# ============================================================
-# Handlers
-# ============================================================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    text = (
-        "🧠 <b>رأي المحلل + المصفوفة</b>\n"
-        "━━━━━━━━━━━━━━━━━━━\n\n"
-        "رسائل مختصرة:\n"
-        "• الإجراء (اشتر/بع) — مع اتجاه واضح\n"
-        "• ثقة الإشارة\n"
-        "• توافق المصفوفة (احتمال صعود/هبوط)\n"
-        "• سياق اليوم\n"
-        "• القرار النهائي\n\n"
-        f"📌 <b>Chat ID:</b> <code>{cid}</code>\n\n"
-        "<b>الأوامر:</b>\n"
-        "/now — فحص فوري (كل العملات)\n"
-        "/sym BTC/USDT — رمز محدد\n"
-        "/matrix BTC — إحصاء المصفوفة\n"
-        "/full BTC — تقرير غني كامل\n"
-        "/raw — تشخيص المصفوفة"
-    )
-    await update.message.reply_text(text, parse_mode="HTML")
-
-
-async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ جاري الفحص...")
-    sent = 0
-    for symbol in SYMBOLS:
-        snap = get_latest_snapshot(symbol)
-        if not snap:
-            continue
-
-        state = snap.get("state", "NO TRADE")
-        if state in ("NO TRADE", "WATCH"):
-            continue
-
-        conf = _confidence(snap)
-        direction = "LONG" if _is_buy_state(state) else "SHORT"
-        msg = build_short_signal(symbol, state, conf, direction, full_details=True)
-
-        if msg:
-            await update.message.reply_text(msg, parse_mode="HTML")
-            sent += 1
-
-    if sent == 0:
-        await update.message.reply_text("لا توجد إشارات نشطة حالياً.")
-
-
-async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("استخدم: /sym BTC/USDT")
-        return
-
-    sym = context.args[0].upper()
-    if "/" not in sym:
-        sym = sym + "/USDT"
-
-    snap = get_latest_snapshot(sym)
-    if not snap:
-        await update.message.reply_text(f"❌ لا توجد بيانات لـ {sym}")
-        return
-
-    state = snap.get("state", "NO TRADE")
-    conf = _confidence(snap)
-    direction = "LONG" if _is_buy_state(state) else "SHORT"
-    msg = build_short_signal(sym, state, conf, direction, full_details=True)
-
-    if msg:
-        await update.message.reply_text(msg, parse_mode="HTML")
-    else:
-        await update.message.reply_text(f"⚪ {sym}: {state} — لا إشارة")
-
-
-async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعرض إحصائيات المصفوفة + الدرجة المركبة + سياق اليوم"""
-    sym = "BTC/USDT"
-    if context.args:
-        s = context.args[0].upper()
-        sym = s if "/" in s else s + "/USDT"
-
-    now = datetime.now(timezone.utc)
-
-    # 1) اتفاق بسيط (البيانات الخام)
-    m = agreement_score(sym, "LONG", now)
-
-    if not m["available"]:
-        debug = debug_matrix(sym, now)
-        text = (
-            f"📊 <b>{sym}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"❌ {m.get('reason', 'غير معروف')}\n\n"
-            f"<b>تشخيص:</b>\n"
-            f"<code>{debug}</code>"
-        )
-        await update.message.reply_text(text, parse_mode="HTML")
-        return
-
-    # 2) الدرجة المركبة للاتجاهين
-    comp_long = matrix_composite_score(sym, "LONG", now)
-    comp_short = matrix_composite_score(sym, "SHORT", now)
-
-    # 3) سياق اليوم
-    day_ctx = day_context(sym, dt=now)
-
-    text = (
-        f"📊 <b>{sym}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>البيانات الخام:</b>\n"
-        f"• Win Rate: <b>{m['win_rate']}%</b>\n"
-        f"• متوسط العائد: {m['avg_return']:+.4f}%\n"
-        f"• العينة: {m['n']} صفقة\n"
-        f"• t-stat: {m['t_stat']:+.3f}\n"
-        f"• المصدر: {m['source']}\n"
-    )
-
-    if comp_long and comp_short:
-        text += (
-            f"\n<b>الدرجة المركبة:</b>\n"
-            f"• 🟢 LONG: <b>{comp_long['composite']}%</b>\n"
-            f"• 🔴 SHORT: <b>{comp_short['composite']}%</b>\n"
-        )
-
-    if day_ctx:
-        text += (
-            f"\n<b>سياق اليوم ({day_ctx['day_name']}):</b>\n"
-            f"{day_ctx['emoji']} {day_ctx['bias']} "
-            f"(WR={day_ctx['avg_wr']}%, RET={day_ctx['avg_ret']:+.4f}%)\n"
-        )
-
-    text += (
-        f"\n<i>تفسير:</i>\n"
-        f"• LONG → {m['win_rate']}% (احتمال صعود)\n"
-        f"• SHORT → {round(100 - m['win_rate'], 1)}% (احتمال هبوط)"
-    )
-
-    await update.message.reply_text(text, parse_mode="HTML")
-
-
-async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تقرير غني كامل للمصفوفة"""
-    sym = "BTC/USDT"
-    if context.args:
-        s = context.args[0].upper()
-        sym = s if "/" in s else s + "/USDT"
-
-    snap = get_latest_snapshot(sym)
-    if not snap:
-        await update.message.reply_text(f"❌ لا توجد بيانات لـ {sym}")
-        return
-
-    state = snap.get("state", "NO TRADE")
-    conf = _confidence(snap)
-    direction = "LONG" if _is_buy_state(state) else "SHORT"
-
-    # نتيجة كاملة
-    result = final_confidence(conf, sym, direction)
-
-    # رسالة غنية من matrix
-    msg = format_matrix_message(sym, result)
-
-    # Telegram: عرض داخل <pre> للحفاظ على التنسيق
-    await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
-
-
-async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تشخيص المصفوفة"""
-    debug = debug_matrix("BTC/USDT")
-    await update.message.reply_text(f"<code>{debug}</code>", parse_mode="HTML")
-
-
-# ============================================================
-# Scheduled Jobs
-# ============================================================
-async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
-    """كل ساعة — رسائل مختصرة لكل إشارة نشطة"""
-    print(f"⏰ [HOURLY] {datetime.now(timezone.utc).strftime('%H:%M')}")
-    sent = 0
-
-    for symbol in SYMBOLS:
-        try:
-            snap = get_latest_snapshot(symbol)
-            if not snap:
-                continue
-
-            state = snap.get("state", "NO TRADE")
-            if state in ("NO TRADE", "WATCH"):
-                continue
-
-            conf = _confidence(snap)
-            direction = "LONG" if _is_buy_state(state) else "SHORT"
-            msg = build_short_signal(symbol, state, conf, direction)
-
-            if msg and CHAT_ID:
-                await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=msg,
-                    parse_mode="HTML",
-                )
-                sent += 1
-                print(f"✅ [{symbol}] أُرسل")
-        except Exception as e:
-            print(f"❌ [{symbol}] {e}")
-
-    if sent == 0:
-        print("⚠️ لا توجد إشارات في هذه الساعة")
-
-
-_state_cache = {}
-
-
-async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    """فحص التغيرات كل 5 دقائق"""
-    try:
-        res = (
-            supabase.table("snapshots").select("*")
-            .order("timestamp", desc=True)
-            .limit(40).execute()
-        )
-        rows = res.data or []
-
-        latest = {}
-        for r in rows:
-            s = r["symbol"]
-            if s not in latest:
-                latest[s] = r
-
-        for symbol, snap in latest.items():
-            state = snap.get("state")
-            score = snap.get("total_score", 0)
-            last = _state_cache.get(symbol)
-
-            if last and last[0] != state:
-                # إشعار عند التغير إلى إشارة
-                if state in ("STRONG BUY SETUP", "BUY SETUP",
-                             "STRONG SELL SETUP", "SELL SETUP",
-                             "EARLY BUY", "EARLY SELL"):
-                    conf = _confidence(snap)
-                    direction = "LONG" if _is_buy_state(state) else "SHORT"
-                    msg = build_short_signal(symbol, state, conf, direction)
-
-                    if msg and CHAT_ID:
-                        header = f"⚡ <b>تغير مفاجئ — {_short(symbol)}</b>\n"
-                        header += f"<i>{last[0]} → {state}</i>\n\n"
-                        await context.bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=header + msg,
-                            parse_mode="HTML",
-                        )
-                        print(f"⚡ [{symbol}] {last[0]} → {state}")
-
-            _state_cache[symbol] = (state, score)
-    except Exception as e:
-        print(f"[alert_job] {e}")
-
-
-# ============================================================
-# Health Server
-# ============================================================
-class _H(BaseHTTPRequestHandler):
+class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(b"OK - Binance Monitor Bot")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -488,40 +91,514 @@ class _H(BaseHTTPRequestHandler):
 
 def _run_health():
     port = int(os.getenv("PORT", "8080"))
-    HTTPServer(("0.0.0.0", port), _H).serve_forever()
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    log.info(f"🩺 Health server على المنفذ {port}")
+    server.serve_forever()
+
+
+# ============================================================
+# أدوات مساعدة
+# ============================================================
+def is_banned() -> bool:
+    return _banned_until_ms > int(time.time() * 1000)
+
+
+def ban_remaining_sec() -> int:
+    if not is_banned():
+        return 0
+    return max(0, (_banned_until_ms - int(time.time() * 1000)) // 1000)
+
+
+def _register_ban(exc: Exception):
+    global _banned_until_ms
+    m = re.search(r"banned until (\d+)", str(exc))
+    if m:
+        _banned_until_ms = int(m.group(1))
+        log.warning(
+            f"⛔ Binance IP banned until "
+            f"{datetime.fromtimestamp(_banned_until_ms/1000, timezone.utc)}"
+        )
+
+
+async def cached_http(key: str, coro_factory, ttl: int = 20):
+    """HTTP مع كاش + كشف الحظر + رسالة واضحة."""
+    if is_banned():
+        raise RuntimeError(
+            f"⛔ Binance حظر IP مؤقتاً. المتبقي: ~{ban_remaining_sec()//60} دقيقة."
+        )
+
+    now = time.time()
+    hit = _http_cache.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+
+    try:
+        val = await coro_factory()
+        _http_cache[key] = (now, val)
+        return val
+    except BinanceAPIException as e:
+        if e.code == -1003:
+            _register_ban(e)
+            raise RuntimeError(
+                f"⛔ Binance حظر IP. المتبقي: ~{ban_remaining_sec()//60} دقيقة."
+            )
+        raise
+
+
+async def send(text: str, context: ContextTypes.DEFAULT_TYPE | None = None):
+    """إرسال للقناة الأساسية."""
+    if not notifications_enabled:
+        return
+    try:
+        if context is not None:
+            await context.bot.send_message(
+                chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML
+            )
+        elif binance_client is not None and _app is not None:
+            await _app.bot.send_message(
+                chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML
+            )
+    except Exception as e:
+        log.error(f"send error: {e}")
+
+
+# ============================================================
+# جلب البيانات
+# ============================================================
+async def fetch_positions() -> list:
+    data = await cached_http(
+        "positions",
+        lambda: binance_client.futures_position_information(),
+        ttl=20,
+    )
+    return [p for p in data if float(p["positionAmt"]) != 0]
+
+
+async def fetch_account() -> dict:
+    return await cached_http(
+        "account",
+        lambda: binance_client.futures_account(),
+        ttl=20,
+    )
+
+
+async def fetch_open_orders() -> list:
+    return await cached_http(
+        "orders",
+        lambda: binance_client.futures_get_open_orders(),
+        ttl=20,
+    )
+
+
+# ============================================================
+# التنسيق
+# ============================================================
+def fmt_position(p: dict) -> str | None:
+    try:
+        amt = float(p["positionAmt"])
+    except (KeyError, ValueError):
+        return None
+    if amt == 0:
+        return None
+
+    side = "🟢 LONG" if amt > 0 else "🔴 SHORT"
+    entry = float(p.get("entryPrice", 0) or 0)
+    mark = float(p.get("markPrice", 0) or 0)
+    pnl = float(p.get("unRealizedProfit", 0) or 0)
+    lev = p.get("leverage", "?")
+    icon = "📈" if pnl >= 0 else "📉"
+
+    lines = [
+        f"{side} | <b>{p.get('symbol', '?')}</b>",
+        f"  الحجم: {abs(amt)}",
+        f"  الدخول: {entry}",
+    ]
+    if mark:
+        lines.append(f"  الحالي: {mark}")
+    lines.append(f"  الرافعة: x{lev}")
+    lines.append(f"  {icon} PnL: <b>{pnl:+.4f} USDT</b>")
+    return "\n".join(lines)
+
+
+HELP_TEXT = (
+    "🤖 <b>بوت مراقبة Binance</b>\n"
+    "━━━━━━━━━━━━━━━━━━━\n\n"
+    "<b>الأوامر:</b>\n"
+    "/positions — الصفقات المفتوحة\n"
+    "/balance — الرصيد والهامش\n"
+    "/pnl — الربح/الخسارة\n"
+    "/orders — الأوامر المعلقة\n"
+    "/status — حالة البوت\n"
+    "/mute — إيقاف الإشعارات\n"
+    "/unmute — تشغيل الإشعارات\n"
+    "/help — المساعدة"
+)
+
+
+# ============================================================
+# أوامر Telegram
+# ============================================================
+def authorized(update: Update) -> bool:
+    return update.effective_chat and update.effective_chat.id == CHAT_ID
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+
+async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        positions = await fetch_positions()
+        if not positions:
+            await update.message.reply_text("لا توجد صفقات مفتوحة حالياً. ✨")
+            return
+
+        body = "\n\n".join(filter(None, (fmt_position(p) for p in positions)))
+        total_pnl = sum(float(p.get("unRealizedProfit", 0) or 0) for p in positions)
+
+        await update.message.reply_text(
+            f"📊 <b>الصفقات المفتوحة ({len(positions)})</b>\n\n"
+            f"{body}\n\n──────────────\n"
+            f"📈 إجمالي PnL: <b>{total_pnl:+.4f} USDT</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.exception("cmd_positions")
+        await update.message.reply_text(f"❌ {e}")
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        account = await fetch_account()
+        wallet = float(account.get("totalWalletBalance", 0) or 0)
+        unrealized = float(account.get("totalUnrealizedProfit", 0) or 0)
+        margin_bal = float(account.get("totalMarginBalance", 0) or 0)
+        available = float(account.get("availableBalance", 0) or 0)
+        used = float(account.get("totalPositionInitialMargin", 0) or 0)
+
+        await update.message.reply_text(
+            f"💰 <b>الرصيد</b>\n\n"
+            f"المحفظة: <b>{wallet:.2f}</b> USDT\n"
+            f"PnL عائم: <b>{unrealized:+.4f}</b> USDT\n"
+            f"رصيد الهامش: <b>{margin_bal:.2f}</b> USDT\n"
+            f"هامش مستخدم: <b>{used:.2f}</b> USDT\n"
+            f"متاح للتداول: <b>{available:.2f}</b> USDT",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.exception("cmd_balance")
+        await update.message.reply_text(f"❌ {e}")
+
+
+async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        positions = await fetch_positions()
+        unrealized = sum(float(p.get("unRealizedProfit", 0) or 0) for p in positions)
+
+        realized_24h = 0.0
+        try:
+            start_ms = int((time.time() - 86400) * 1000)
+            income = await cached_http(
+                "income_24h",
+                lambda: binance_client.futures_income_history(
+                    startTime=start_ms, incomeType="REALIZED_PNL", limit=1000
+                ),
+                ttl=60,
+            )
+            realized_24h = sum(float(i["income"]) for i in income)
+        except Exception as e:
+            log.warning(f"income_history: {e}")
+
+        lines = []
+        for p in positions:
+            pnl = float(p.get("unRealizedProfit", 0) or 0)
+            icon = "📈" if pnl >= 0 else "📉"
+            lines.append(f"{icon} <b>{p.get('symbol', '?')}</b>: {pnl:+.4f} USDT")
+        breakdown = "\n".join(lines) if lines else "—"
+
+        await update.message.reply_text(
+            f"📊 <b>PnL</b>\n\n"
+            f"عائم الآن: <b>{unrealized:+.4f}</b> USDT\n"
+            f"محقق (24س): <b>{realized_24h:+.4f}</b> USDT\n\n"
+            f"<b>تفصيل:</b>\n{breakdown}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.exception("cmd_pnl")
+        await update.message.reply_text(f"❌ {e}")
+
+
+async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        orders = await fetch_open_orders()
+        if not orders:
+            await update.message.reply_text("لا توجد أوامر معلقة.")
+            return
+        lines = []
+        for o in orders:
+            price = o.get("price") or o.get("stopPrice") or "Market"
+            lines.append(
+                f"• <b>{o['symbol']}</b> {o['side']} {o['type']}\n"
+                f"  الكمية: {o['origQty']} @ {price}"
+            )
+        await update.message.reply_text(
+            f"📋 <b>الأوامر المعلقة ({len(orders)})</b>\n\n" + "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.exception("cmd_orders")
+        await update.message.reply_text(f"❌ {e}")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    status = "🟢 متصل" if binance_client else "🔴 غير متصل"
+    notif = "🔔 مفعلة" if notifications_enabled else "🔕 مكتومة"
+    ban = (f"\n⛔ محظور — متبقي ~{ban_remaining_sec()//60} دقيقة"
+           if is_banned() else "")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    await update.message.reply_text(
+        f"🤖 <b>حالة البوت</b>\n\n"
+        f"Binance: {status}\n"
+        f"الإشعارات: {notif}\n"
+        f"الوقت: {ts}{ban}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global notifications_enabled
+    if not authorized(update):
+        return
+    notifications_enabled = False
+    await update.message.reply_text("🔕 تم إيقاف الإشعارات.")
+
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global notifications_enabled
+    if not authorized(update):
+        return
+    notifications_enabled = True
+    await update.message.reply_text("🔔 تم تشغيل الإشعارات.")
+
+
+# ============================================================
+# Jobs (تعمل عبر JobQueue)
+# ============================================================
+async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
+    """تقرير كل ساعة."""
+    try:
+        if is_banned():
+            log.warning("hourly: متخطى (حظر)")
+            return
+
+        positions = await fetch_positions()
+        try:
+            account = await fetch_account()
+            balance = float(account.get("totalWalletBalance", 0) or 0)
+        except Exception:
+            balance = 0.0
+
+        unrealized = sum(float(p.get("unRealizedProfit", 0) or 0) for p in positions)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        if not positions:
+            msg = (
+                f"⏰ <b>تقرير كل ساعة</b> | {ts}\n\n"
+                f"لا توجد صفقات مفتوحة.\n"
+                f"💰 الرصيد: {balance:.2f} USDT"
+            )
+        else:
+            body = "\n\n".join(filter(None, (fmt_position(p) for p in positions)))
+            msg = (
+                f"⏰ <b>تقرير كل ساعة</b> | {ts}\n\n{body}\n\n"
+                f"──────────────\n"
+                f"💰 الرصيد: {balance:.2f} USDT\n"
+                f"📊 PnL: {unrealized:+.4f} USDT\n"
+                f"🔢 العدد: {len(positions)}"
+            )
+
+        await context.bot.send_message(
+            chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.HTML
+        )
+        log.info("✅ Hourly report sent")
+    except Exception as e:
+        log.exception(f"hourly_job: {e}")
+
+
+# ============================================================
+# WebSocket (يعمل في task منفصل)
+# ============================================================
+async def user_stream_task(app: Application):
+    """يستمع لتحديثات Binance ويرسل إشعارات."""
+    bsm = BinanceSocketManager(binance_client)
+    while True:
+        try:
+            async with bsm.futures_user_socket() as stream:
+                log.info("🔌 WebSocket متصل")
+                try:
+                    await app.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text="🔌 تم الاتصال بـ Binance WebSocket",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+
+                while True:
+                    msg = await stream.recv()
+
+                    # فتح/تعديل صفقة
+                    if msg.get("e") == "ACCOUNT_UPDATE":
+                        for pos in msg["a"]["P"]:
+                            amt = float(pos["pa"])
+                            if amt != 0 and pos.get("bc", "0") == "0":
+                                side = "🟢 LONG" if amt > 0 else "🔴 SHORT"
+                                text = (
+                                    f"🚀 <b>صفقة مفتوحة</b>\n\n"
+                                    f"الاتجاه: {side}\n"
+                                    f"الرمز: <b>{pos['s']}</b>\n"
+                                    f"الحجم: {abs(amt)}\n"
+                                    f"الدخول: {pos['ep']}"
+                                )
+                                if notifications_enabled:
+                                    try:
+                                        await app.bot.send_message(
+                                            chat_id=CHAT_ID, text=text,
+                                            parse_mode=ParseMode.HTML,
+                                        )
+                                    except Exception as e:
+                                        log.error(f"WS send: {e}")
+
+                    # تنفيذ أمر
+                    elif msg.get("e") == "ORDER_TRADE_UPDATE":
+                        o = msg["o"]
+                        if o["X"] == "FILLED":
+                            rp_val = float(o.get("rp", "0") or 0)
+                            pnl_txt = (
+                                f"\n💰 PnL محقق: <b>{rp_val:+.4f} USDT</b>"
+                                if rp_val != 0 else ""
+                            )
+                            text = (
+                                f"⚡ <b>تنفيذ أمر</b>\n"
+                                f"الرمز: <b>{o['s']}</b>\n"
+                                f"الاتجاه: {o['S']}\n"
+                                f"الكمية: {o['q']}\n"
+                                f"متوسط السعر: {o.get('ap') or '0'}{pnl_txt}"
+                            )
+                            if notifications_enabled:
+                                try:
+                                    await app.bot.send_message(
+                                        chat_id=CHAT_ID, text=text,
+                                        parse_mode=ParseMode.HTML,
+                                    )
+                                except Exception as e:
+                                    log.error(f"WS send: {e}")
+        except Exception as e:
+            log.exception(f"user_stream: {e}")
+            await asyncio.sleep(WS_RECONNECT_DELAY)
+
+
+async def post_init(app: Application):
+    """يشغّل مهام Binance بعد جاهزية التطبيق."""
+    global binance_client, _app
+    _app = app
+
+    binance_client = await AsyncClient.create(API_KEY, API_SECRET)
+    log.info("Binance client جاهز")
+
+    # WebSocket في task خلفي
+    app.create_task(user_stream_task(app))
+
+    # رسالة بدء
+    try:
+        await app.bot.send_message(
+            chat_id=CHAT_ID,
+            text="🤖 <b>بدأ بوت مراقبة Binance</b>\nأرسل /help للأوامر.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.error(f"startup send: {e}")
+
+
+async def post_shutdown(app: Application):
+    if binance_client:
+        await binance_client.close_connection()
+        log.info("Binance client مُغلق")
+
+
+async def error_handler(update, context):
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning(f"⚠️ network: {err}")
+        return
+    log.error(f"❌ error: {err}", exc_info=err)
 
 
 # ============================================================
 # Main
 # ============================================================
+_app: Application | None = None
+
+
 def main():
+    # 1) Health server (ليعمل على Web Service)
     threading.Thread(target=_run_health, daemon=True).start()
-    print("🧠 Analyst Bot + Matrix يبدأ...")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    print("🚀 Binance Monitor Bot يبدأ...")
 
-    # Handlers
+    # 2) تطبيق Telegram
+    app = Application.builder() \
+        .token(TELEGRAM_TOKEN) \
+        .post_init(post_init) \
+        .post_shutdown(post_shutdown) \
+        .build()
+
+    # 3) Handlers
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("now", cmd_now))
-    app.add_handler(CommandHandler("sym", cmd_symbol))
-    app.add_handler(CommandHandler("matrix", cmd_matrix))
-    app.add_handler(CommandHandler("full", cmd_full))
-    app.add_handler(CommandHandler("raw", cmd_raw))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("orders", cmd_orders))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("mute", cmd_mute))
+    app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_error_handler(error_handler)
 
-    # Jobs
+    # 4) Jobs
     if app.job_queue:
         app.job_queue.run_repeating(
-            hourly_job, interval=HOURLY_MIN * 60, first=10, name="hourly"
+            hourly_job,
+            interval=HOURLY_MIN * 60,
+            first=300,     # أول تقرير بعد 5 دقائق
+            name="hourly",
         )
-        app.job_queue.run_repeating(
-            alert_job, interval=ALERT_MIN * 60, first=30, name="alerts"
-        )
-        print(f"⏰ كل {HOURLY_MIN} دقيقة: رسائل مختصرة")
-        print(f"⚡ كل {ALERT_MIN} دقائق: تغيرات مفاجئة")
+        print(f"⏰ تقرير كل {HOURLY_MIN} دقيقة")
 
     print("✅ Bot جاهز")
 
+    # 5) التشغيل (نفس طريقة bot.py)
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
