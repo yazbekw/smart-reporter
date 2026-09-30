@@ -277,6 +277,47 @@ def api_diagnose():
 
     return jsonify(out)
 
+@app.route('/api/diagnose_supabase')
+def api_diagnose_supabase():
+    """تشخيص فوري لاتصال Supabase"""
+    from backtest_config import CFG
+    out = {
+        "url": CFG["SUPABASE_URL"],
+        "key_length": len(CFG["SUPABASE_KEY"]) if CFG["SUPABASE_KEY"] else 0,
+        "key_prefix": CFG["SUPABASE_KEY"][:20] if CFG["SUPABASE_KEY"] else "",
+        "key_suffix": CFG["SUPABASE_KEY"][-10:] if CFG["SUPABASE_KEY"] else "",
+        "starts_with_eyJ": CFG["SUPABASE_KEY"].startswith("eyJ") if CFG["SUPABASE_KEY"] else False,
+    }
+
+    # اختبار الاتصال
+    try:
+        from backtest_data import _sb_client
+        sb = _sb_client()
+        res = sb.table("candles").select("symbol").limit(1).execute()
+        out["connection"] = "✅ ناجح"
+        out["sample_data"] = res.data
+    except Exception as e:
+        out["connection"] = f"❌ فشل: {type(e).__name__}: {str(e)[:200]}"
+
+    # اختبار الكتابة
+    try:
+        from backtest_data import _sb_client
+        sb = _sb_client()
+        sb.table("candles").upsert({
+            "symbol": "__DIAG__",
+            "open_time": 0,
+            "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0,
+            "volume": 0.0, "quote_volume": 0.0, "taker_buy_base": 0.0,
+            "interval": "15m",
+        }).execute()
+        out["write_test"] = "✅ نجح"
+        # نظّف
+        sb.table("candles").delete().eq("symbol", "__DIAG__").execute()
+    except Exception as e:
+        out["write_test"] = f"❌ فشل: {type(e).__name__}: {str(e)[:200]}"
+
+    return jsonify(out)
+
 @app.route('/api/config')
 def api_config():
     """يعرض الإعدادات الحالية"""
