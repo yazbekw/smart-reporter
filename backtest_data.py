@@ -1,5 +1,5 @@
 """
-backtest_data.py — جلب وتخزين الشموع في Supabase
+backtest_data.py — جلب وتخزين الشموع مع تشخيص كامل
 """
 import io
 import time
@@ -17,7 +17,11 @@ _sb = None
 def _sb_client():
     global _sb
     if _sb is None:
-        _sb = create_client(CFG["SUPABASE_URL"], CFG["SUPABASE_KEY"])
+        url = CFG["SUPABASE_URL"]
+        key = CFG["SUPABASE_KEY"]
+        print(f"[SB] URL: {url[:40]}...")
+        print(f"[SB] Key: {key[:25]}... (len={len(key)})")
+        _sb = create_client(url, key)
     return _sb
 
 
@@ -30,31 +34,75 @@ def _normalize_ts(ts):
 
 
 # ============================================================
+# تشخيص الجدول
+# ============================================================
+def diagnose_table():
+    """يتحقق من وجود جدول candles وإمكانية الكتابة"""
+    sb = _sb_client()
+    result = {"ok": False, "issues": [], "info": {}}
+
+    # 1. هل الجدول موجود؟
+    try:
+        res = sb.table("candles").select("symbol").limit(1).execute()
+        result["info"]["table_exists"] = True
+        result["info"]["existing_rows"] = "unknown (res.data length)"
+        print("[DIAG] ✅ جدول candles موجود")
+    except Exception as e:
+        result["issues"].append(f"جدول غير موجود أو خطأ: {e}")
+        print(f"[DIAG] ❌ جدول candles: {e}")
+        return result
+
+    # 2. اختبار كتابة
+    test_row = {
+        "symbol": "__TEST__",
+        "open_time": 0,
+        "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0,
+        "volume": 0.0, "quote_volume": 0.0, "taker_buy_base": 0.0,
+        "interval": "15m",
+    }
+    try:
+        sb.table("candles").upsert(test_row).execute()
+        print("[DIAG] ✅ الكتابة تعمل")
+        # نظّف
+        sb.table("candles").delete().eq("symbol", "__TEST__").execute()
+        result["ok"] = True
+    except Exception as e:
+        result["issues"].append(f"فشل الكتابة: {e}")
+        print(f"[DIAG] ❌ الكتابة: {e}")
+
+    return result
+
+
+# ============================================================
 # قراءة من Supabase
 # ============================================================
 def _cache_count(symbol, days):
-    """كم شمعة موجودة في cache؟"""
     sb = _sb_client()
     cutoff = int(
         (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
     )
-    res = (
-        sb.table("candles")
-        .select("open_time", count="exact")
-        .eq("symbol", symbol)
-        .gte("open_time", cutoff)
-        .execute()
-    )
-    return res.count or 0
+    try:
+        res = (
+            sb.table("candles")
+            .select("open_time", count="exact")
+            .eq("symbol", symbol)
+            .gte("open_time", cutoff)
+            .execute()
+        )
+        return res.count or 0
+    except Exception as e:
+        print(f"[cache_count] {symbol}: {e}")
+        return 0
 
 
 def cache_has_data(symbol, days):
     n = _cache_count(symbol, days)
-    return n >= days * 90  # ~90 شمعة/يوم
+    need = days * 90
+    print(f"[cache] {symbol}: {n} شمعة (المطلوب ≥ {need})")
+    return n >= need
 
 
 def load_candles(symbol, days=None):
-    """يقرأ الشموع من Supabase (مع pagination)"""
     if days is None:
         days = CFG["DAYS"]
     sb = _sb_client()
@@ -66,15 +114,19 @@ def load_candles(symbol, days=None):
     page_size = 1000
     offset = 0
     while True:
-        res = (
-            sb.table("candles")
-            .select("open_time,open,high,low,close,volume,quote_volume,taker_buy_base")
-            .eq("symbol", symbol)
-            .gte("open_time", cutoff)
-            .order("open_time")
-            .range(offset, offset + page_size - 1)
-            .execute()
-        )
+        try:
+            res = (
+                sb.table("candles")
+                .select("open_time,open,high,low,close,volume,quote_volume,taker_buy_base")
+                .eq("symbol", symbol)
+                .gte("open_time", cutoff)
+                .order("open_time")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+        except Exception as e:
+            print(f"[load_candles] {symbol} page {offset}: {e}")
+            break
         rows = res.data or []
         if not rows:
             break
@@ -83,22 +135,42 @@ def load_candles(symbol, days=None):
             break
         offset += page_size
 
+    print(f"[load_candles] {symbol}: {len(all_rows)} شمعة")
     return all_rows
 
 
 # ============================================================
 # جلب من Binance Vision
 # ============================================================
-def fetch_vision_month(symbol, year, month):
+def fetch_vision_month(symbol, year, month, verbose=True):
+    """يجلب ملف شهر واحد — مع logging مفصّل"""
     fname = f"{symbol}-15m-{year}-{month:02d}.zip"
     url = f"{VISION_BASE}/{symbol}/15m/{fname}"
+
+    if verbose:
+        print(f"[VISION] GET {url}")
+
     try:
         r = requests.get(url, timeout=60)
+        if verbose:
+            print(f"[VISION] HTTP {r.status_code}, size={len(r.content)} bytes")
+
         if r.status_code != 200:
             return []
-        z = zipfile.ZipFile(io.BytesIO(r.content))
+
+        try:
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+        except zipfile.BadZipFile as e:
+            print(f"[VISION] ❌ ZIP corrupt: {e}")
+            return []
+
+        names = z.namelist()
+        if not names:
+            print(f"[VISION] ❌ ZIP فارغ")
+            return []
+
         rows = []
-        with z.open(z.namelist()[0]) as f:
+        with z.open(names[0]) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -122,46 +194,69 @@ def fetch_vision_month(symbol, year, month):
                     })
                 except Exception:
                     continue
+
+        if verbose:
+            print(f"[VISION] parsed {len(rows)} شمعة من {year}-{month:02d}")
+
         return rows
+
     except Exception as e:
-        print(f"  ⚠️ {symbol} {year}-{month:02d}: {e}")
+        print(f"[VISION] ❌ {symbol} {year}-{month:02d}: {e}")
         return []
 
 
 # ============================================================
-# حفظ في Supabase (batches)
+# حفظ في Supabase — مع logging مفصّل
 # ============================================================
-def save_candles(rows, batch_size=500):
-    """يُخزّن على دفعات لتجنب مشاكل payload"""
+def save_candles(rows, batch_size=500, verbose=True):
+    """يُخزّن على دفعات — مع تسجيل كل خطأ"""
     if not rows:
         return 0
+
     sb = _sb_client()
     total = 0
+    failed = 0
+
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         try:
-            sb.table("candles").upsert(batch).execute()
+            res = sb.table("candles").upsert(batch).execute()
             total += len(batch)
+            if verbose and (i // batch_size) % 5 == 0:
+                print(f"[SAVE] ✅ batch {i}-{i+len(batch)} ({total}/{len(rows)})")
         except Exception as e:
-            print(f"  ❌ batch {i}: {e}")
+            failed += len(batch)
+            err_str = str(e)[:200]
+            print(f"[SAVE] ❌ batch {i}-{i+len(batch)}: {err_str}")
+
+    if verbose:
+        print(f"[SAVE] انتهى: نجح={total}, فشل={failed}")
+
     return total
 
 
 # ============================================================
-# التنسيق العام
+# الجلب والتخزين
 # ============================================================
 def fetch_and_store(symbol, days=None, progress_cb=None):
-    """يجلب آخر N يوم من Binance Vision ويخزّنها"""
+    """يجلب آخر N يوم ويخزّنها"""
     if days is None:
         days = CFG["DAYS"]
 
-    if cache_has_data(symbol, days):
+    def _log(msg):
+        print(msg)
         if progress_cb:
-            progress_cb(f"  ✅ {symbol}: موجود في cache")
-        return 0
+            progress_cb(msg)
 
-    if progress_cb:
-        progress_cb(f"  ⬇️  {symbol}: جلب من Binance Vision...")
+    # فحص cache أولاً
+    try:
+        if cache_has_data(symbol, days):
+            _log(f"  ✅ {symbol}: موجود في cache")
+            return 0
+    except Exception as e:
+        _log(f"  ⚠️ {symbol}: فحص cache فشل ({str(e)[:80]})")
+
+    _log(f"  ⬇️  {symbol}: جلب من Binance Vision...")
 
     now = datetime.now(timezone.utc)
     months = []
@@ -172,12 +267,16 @@ def fetch_and_store(symbol, days=None, progress_cb=None):
 
     total = 0
     for (year, month) in months:
-        rows = fetch_vision_month(symbol, year, month)
-        if rows:
-            saved = save_candles(rows)
-            total += saved
-            if progress_cb:
-                progress_cb(f"  📥 {symbol} {year}-{month:02d}: {saved} شمعة")
+        try:
+            rows = fetch_vision_month(symbol, year, month, verbose=False)
+            if rows:
+                saved = save_candles(rows, verbose=False)
+                total += saved
+                _log(f"  📥 {symbol} {year}-{month:02d}: {saved} شمعة")
+            else:
+                _log(f"  ⚪ {symbol} {year}-{month:02d}: لا بيانات")
+        except Exception as e:
+            _log(f"  ⚠️ {symbol} {year}-{month:02d}: {str(e)[:80]}")
         time.sleep(0.3)
 
     return total
@@ -185,6 +284,19 @@ def fetch_and_store(symbol, days=None, progress_cb=None):
 
 def prepare_all_data(progress_cb=None):
     """يجلب كل العملات"""
+    def _log(msg):
+        print(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    # تشخيص أولاً
+    _log("🔍 تشخيص اتصال Supabase...")
+    diag = diagnose_table()
+    if not diag["ok"]:
+        _log(f"❌ فشل التشخيص: {diag['issues']}")
+        return 0
+    _log("✅ الاتصال بـ Supabase سليم")
+
     total = 0
     for sym in CFG["SYMBOLS"]:
         total += fetch_and_store(sym, CFG["DAYS"], progress_cb)
@@ -192,7 +304,7 @@ def prepare_all_data(progress_cb=None):
 
 
 # ============================================================
-# Supabase Backtest runs
+# Backtest runs
 # ============================================================
 def create_backtest_run(config_json):
     sb = _sb_client()
@@ -210,7 +322,6 @@ def update_backtest_run(run_id, **fields):
 
 
 def save_backtest_trades(run_id, trades):
-    """يُخزّن الصفقات على دفعات"""
     if not trades:
         return
     sb = _sb_client()
@@ -240,4 +351,4 @@ def save_backtest_trades(run_id, trades):
         try:
             sb.table("backtest_trades").insert(batch).execute()
         except Exception as e:
-            print(f"  ❌ trades batch {i}: {e}")
+            print(f"[trades] batch {i}: {e}")
