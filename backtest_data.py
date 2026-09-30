@@ -1,14 +1,24 @@
-"""جلب وتخزين الشموع التاريخية"""
+"""
+backtest_data.py — جلب وتخزين الشموع في Supabase
+"""
 import io
-import os
 import time
 import zipfile
-import sqlite3
 import requests
 from datetime import datetime, timezone, timedelta
+from supabase import create_client
 from backtest_config import CFG
 
 VISION_BASE = "https://data.binance.vision/data/spot/monthly/klines"
+
+_sb = None
+
+
+def _sb_client():
+    global _sb
+    if _sb is None:
+        _sb = create_client(CFG["SUPABASE_URL"], CFG["SUPABASE_KEY"])
+    return _sb
 
 
 def _normalize_ts(ts):
@@ -19,33 +29,67 @@ def _normalize_ts(ts):
     return ts
 
 
-def init_cache():
-    con = sqlite3.connect(CFG["CACHE_DB"])
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS candles (
-            symbol TEXT NOT NULL,
-            open_time INTEGER NOT NULL,
-            open REAL, high REAL, low REAL, close REAL,
-            volume REAL, quote_volume REAL, taker_buy_base REAL,
-            PRIMARY KEY (symbol, open_time)
+# ============================================================
+# قراءة من Supabase
+# ============================================================
+def _cache_count(symbol, days):
+    """كم شمعة موجودة في cache؟"""
+    sb = _sb_client()
+    cutoff = int(
+        (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
+    )
+    res = (
+        sb.table("candles")
+        .select("open_time", count="exact")
+        .eq("symbol", symbol)
+        .gte("open_time", cutoff)
+        .execute()
+    )
+    return res.count or 0
+
+
+def cache_has_data(symbol, days):
+    n = _cache_count(symbol, days)
+    return n >= days * 90  # ~90 شمعة/يوم
+
+
+def load_candles(symbol, days=None):
+    """يقرأ الشموع من Supabase (مع pagination)"""
+    if days is None:
+        days = CFG["DAYS"]
+    sb = _sb_client()
+    cutoff = int(
+        (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
+    )
+
+    all_rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        res = (
+            sb.table("candles")
+            .select("open_time,open,high,low,close,volume,quote_volume,taker_buy_base")
+            .eq("symbol", symbol)
+            .gte("open_time", cutoff)
+            .order("open_time")
+            .range(offset, offset + page_size - 1)
+            .execute()
         )
-    """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_sym_time ON candles(symbol, open_time)")
-    con.commit()
-    return con
+        rows = res.data or []
+        if not rows:
+            break
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    return all_rows
 
 
-def cache_has_data(con, symbol, days=180):
-    cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
-    row = con.execute(
-        "SELECT COUNT(*) FROM candles WHERE symbol=? AND open_time>=?",
-        (symbol, cutoff)
-    ).fetchone()
-    return row[0] >= days * 90  # ~90 شمعة/يوم × 15 دقيقة
-
-
+# ============================================================
+# جلب من Binance Vision
+# ============================================================
 def fetch_vision_month(symbol, year, month):
-    """يجلب ملف شهر واحد من Binance Vision"""
     fname = f"{symbol}-15m-{year}-{month:02d}.zip"
     url = f"{VISION_BASE}/{symbol}/15m/{fname}"
     try:
@@ -64,14 +108,18 @@ def fetch_vision_month(symbol, year, month):
                     continue
                 try:
                     ts_sec = _normalize_ts(int(parts[0]))
-                    rows.append((
-                        symbol,
-                        ts_sec * 1000,
-                        float(parts[1]), float(parts[2]),
-                        float(parts[3]), float(parts[4]),
-                        float(parts[5]), float(parts[7]),
-                        float(parts[9]) if len(parts) > 9 else 0.0,
-                    ))
+                    rows.append({
+                        "symbol": symbol,
+                        "open_time": ts_sec * 1000,
+                        "open": float(parts[1]),
+                        "high": float(parts[2]),
+                        "low": float(parts[3]),
+                        "close": float(parts[4]),
+                        "volume": float(parts[5]),
+                        "quote_volume": float(parts[7]),
+                        "taker_buy_base": float(parts[9]) if len(parts) > 9 else 0.0,
+                        "interval": "15m",
+                    })
                 except Exception:
                     continue
         return rows
@@ -80,13 +128,41 @@ def fetch_vision_month(symbol, year, month):
         return []
 
 
-def fetch_and_cache(con, symbol, days=180):
-    """يجلب آخر N يوماً ويخزّنها"""
-    if cache_has_data(con, symbol, days):
-        print(f"  ✅ {symbol}: موجود في cache")
-        return
+# ============================================================
+# حفظ في Supabase (batches)
+# ============================================================
+def save_candles(rows, batch_size=500):
+    """يُخزّن على دفعات لتجنب مشاكل payload"""
+    if not rows:
+        return 0
+    sb = _sb_client()
+    total = 0
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        try:
+            sb.table("candles").upsert(batch).execute()
+            total += len(batch)
+        except Exception as e:
+            print(f"  ❌ batch {i}: {e}")
+    return total
 
-    print(f"  ⬇️  {symbol}: جلب من Binance Vision...")
+
+# ============================================================
+# التنسيق العام
+# ============================================================
+def fetch_and_store(symbol, days=None, progress_cb=None):
+    """يجلب آخر N يوم من Binance Vision ويخزّنها"""
+    if days is None:
+        days = CFG["DAYS"]
+
+    if cache_has_data(symbol, days):
+        if progress_cb:
+            progress_cb(f"  ✅ {symbol}: موجود في cache")
+        return 0
+
+    if progress_cb:
+        progress_cb(f"  ⬇️  {symbol}: جلب من Binance Vision...")
+
     now = datetime.now(timezone.utc)
     months = []
     for i in range(8):
@@ -98,39 +174,70 @@ def fetch_and_cache(con, symbol, days=180):
     for (year, month) in months:
         rows = fetch_vision_month(symbol, year, month)
         if rows:
-            con.executemany(
-                "INSERT OR IGNORE INTO candles VALUES (?,?,?,?,?,?,?,?,?)",
-                rows,
-            )
-            con.commit()
-            total += len(rows)
+            saved = save_candles(rows)
+            total += saved
+            if progress_cb:
+                progress_cb(f"  📥 {symbol} {year}-{month:02d}: {saved} شمعة")
         time.sleep(0.3)
 
-    print(f"  ✅ {symbol}: {total} شمعة")
+    return total
 
 
-def load_candles(con, symbol, days=180):
-    """يقرأ الشموع من cache"""
-    cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
-    rows = con.execute(
-        """SELECT open_time, open, high, low, close, volume, quote_volume, taker_buy_base
-           FROM candles WHERE symbol=? AND open_time>=?
-           ORDER BY open_time""",
-        (symbol, cutoff),
-    ).fetchall()
-    return [
-        {
-            "open_time": r[0], "open": r[1], "high": r[2],
-            "low": r[3], "close": r[4], "volume": r[5],
-            "quote_volume": r[6], "taker_buy_base": r[7],
-        }
-        for r in rows
-    ]
-
-
-def prepare_all_data():
-    """يحمّل كل العملات"""
-    con = init_cache()
+def prepare_all_data(progress_cb=None):
+    """يجلب كل العملات"""
+    total = 0
     for sym in CFG["SYMBOLS"]:
-        fetch_and_cache(con, sym, CFG["DAYS"])
-    return con
+        total += fetch_and_store(sym, CFG["DAYS"], progress_cb)
+    return total
+
+
+# ============================================================
+# Supabase Backtest runs
+# ============================================================
+def create_backtest_run(config_json):
+    sb = _sb_client()
+    res = sb.table("backtest_runs").insert({
+        "status": "running",
+        "config_json": config_json,
+    }).execute()
+    return res.data[0]["id"] if res.data else None
+
+
+def update_backtest_run(run_id, **fields):
+    sb = _sb_client()
+    fields["finished_at"] = datetime.now(timezone.utc).isoformat()
+    sb.table("backtest_runs").update(fields).eq("id", run_id).execute()
+
+
+def save_backtest_trades(run_id, trades):
+    """يُخزّن الصفقات على دفعات"""
+    if not trades:
+        return
+    sb = _sb_client()
+    batch_size = 500
+    for i in range(0, len(trades), batch_size):
+        batch = []
+        for t in trades[i:i + batch_size]:
+            batch.append({
+                "run_id": run_id,
+                "symbol": t.get("symbol"),
+                "direction": t.get("direction"),
+                "entry_time": t.get("time_utc"),
+                "entry_price": t.get("entry"),
+                "exit_price": t.get("exit"),
+                "exit_reason": t.get("exit_reason"),
+                "sl_pct": t.get("sl_pct"),
+                "tp_pct": t.get("tp_pct"),
+                "rr": t.get("rr"),
+                "position_usd": t.get("size_usd"),
+                "pnl_usd": t.get("pnl_usd"),
+                "pnl_pct": t.get("pnl_pct"),
+                "hold_candles": t.get("hold_candles"),
+                "classification": t.get("classification"),
+                "final_conf": t.get("final_conf"),
+                "composite": t.get("composite"),
+            })
+        try:
+            sb.table("backtest_trades").insert(batch).execute()
+        except Exception as e:
+            print(f"  ❌ trades batch {i}: {e}")
