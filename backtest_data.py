@@ -13,7 +13,6 @@ VISION_BASE = "https://data.binance.vision/data/spot/monthly/klines"
 
 _sb = None
 
-
 def _sb_client():
     global _sb
     if _sb is None:
@@ -21,7 +20,18 @@ def _sb_client():
         key = CFG["SUPABASE_KEY"]
         print(f"[SB] URL: {url[:40]}...")
         print(f"[SB] Key: {key[:25]}... (len={len(key)})")
-        _sb = create_client(url, key)
+
+        # ✅ إضافة timeout طويل
+        try:
+            from supabase import create_client, ClientOptions
+            options = ClientOptions(
+                postgrest_client_timeout=60,     # 60 ثانية بدل 10
+                storage_client_timeout=60,
+            )
+            _sb = create_client(url, key, options=options)
+        except (ImportError, TypeError):
+            # fallback لإصدارات أقدم
+            _sb = create_client(url, key)
     return _sb
 
 
