@@ -1089,20 +1089,16 @@ async function startJob(job) {
   if (!confirm(`هل تريد ${info.label}؟`)) return;
 
   try {
-    const r = await fetch(`/api/${job}`, {method: 'POST'});
+    // ✅ GET بدل POST (شبكات الجوال تحجب POST)
+    const r = await fetch(`/api/${job}?t=${Date.now()}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     if (!j.ok) { alert(j.msg || 'فشل بدء العملية'); return; }
     startPolling();
   } catch (e) {
-    alert('خطأ: ' + e);
+    console.error('startJob error:', e);
+    alert('تعذّر الاتصال بالخدمة.\nحاول مرة أخرى أو أعد تحميل الصفحة.');
   }
-}
-
-function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  document.getElementById('statusPanel').classList.add('show');
-  pollStatus();
-  pollTimer = setInterval(pollStatus, 2000);
 }
 
 async function pollStatus() {
