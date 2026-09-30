@@ -269,8 +269,10 @@ def fetch_vision_month(symbol, year, month, verbose=False):
 # تنظيف الصفوف
 # ============================================================
 def _clean_rows(rows):
-    """ينظّف الصفوف قبل الحفظ"""
+    """ينظّف + يُزيل التكرار"""
     cleaned = []
+    seen = set()
+
     for r in rows:
         try:
             sym = str(r.get("symbol", "")).strip()
@@ -279,6 +281,12 @@ def _clean_rows(rows):
             ot = int(r.get("open_time", 0))
             if ot <= 0 or ot > 9_999_999_999_999:
                 continue
+
+            # ✅ إزالة التكرار
+            key = (sym, ot)
+            if key in seen:
+                continue
+            seen.add(key)
 
             vals = {
                 "open": r.get("open", 0),
@@ -300,6 +308,7 @@ def _clean_rows(rows):
             })
         except Exception:
             continue
+
     return cleaned
 
 
