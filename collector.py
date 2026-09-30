@@ -235,6 +235,47 @@ def api_status():
         }
     return jsonify(s)
 
+@app.route('/api/diagnose')
+def api_diagnose():
+    """تشخيص شامل — Supabase + Binance Vision"""
+    out = {
+        "supabase": {},
+        "binance_vision": {},
+        "config": {},
+    }
+
+    # 1. فحص Supabase
+    try:
+        from backtest_data import _sb_client, diagnose_table
+        diag = diagnose_table()
+        out["supabase"] = diag
+    except Exception as e:
+        out["supabase"] = {"ok": False, "error": str(e)}
+
+    # 2. فحص Binance Vision
+    try:
+        import requests
+        url = "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/15m/BTCUSDT-15m-2026-06.zip"
+        r = requests.head(url, timeout=10)
+        out["binance_vision"] = {
+            "url": url,
+            "status_code": r.status_code,
+            "ok": r.status_code == 200,
+            "size": r.headers.get("Content-Length", "unknown"),
+        }
+    except Exception as e:
+        out["binance_vision"] = {"ok": False, "error": str(e)}
+
+    # 3. الإعدادات
+    from backtest_config import CFG
+    out["config"] = {
+        "SUPABASE_URL": CFG["SUPABASE_URL"][:40] + "..." if CFG["SUPABASE_URL"] else "MISSING",
+        "SUPABASE_KEY_len": len(CFG["SUPABASE_KEY"]) if CFG["SUPABASE_KEY"] else 0,
+        "SYMBOLS": CFG["SYMBOLS"],
+        "DAYS": CFG["DAYS"],
+    }
+
+    return jsonify(out)
 
 @app.route('/api/config')
 def api_config():
