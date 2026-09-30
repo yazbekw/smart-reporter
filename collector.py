@@ -385,7 +385,129 @@ def api_report():
         "run_id": result.get("run_id"),
     })
 
+@app.route('/api/stress_test')
+def api_stress_test():
+    """
+    اختبار ضغط كامل يكشف الحد الفعلي للمشكلة
+    """
+    import traceback
+    from backtest_config import CFG
 
+    out = {
+        "env": {
+            "url": CFG["SUPABASE_URL"],
+            "key_len": len(CFG["SUPABASE_KEY"]) if CFG["SUPABASE_KEY"] else 0,
+            "key_head": CFG["SUPABASE_KEY"][:30] if CFG["SUPABASE_KEY"] else "",
+            "key_tail": CFG["SUPABASE_KEY"][-15:] if CFG["SUPABASE_KEY"] else "",
+        },
+        "tests": [],
+    }
+
+    from backtest_data import _sb_client
+    sb = _sb_client()
+
+    # اختبار 1: SELECT
+    try:
+        res = sb.table("candles").select("symbol").limit(1).execute()
+        out["tests"].append({
+            "name": "select_1",
+            "ok": True,
+            "rows": len(res.data) if res.data else 0,
+        })
+    except Exception as e:
+        out["tests"].append({
+            "name": "select_1",
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error": str(e)[:500],
+            "trace": traceback.format_exc()[-500:],
+        })
+        return jsonify(out)
+
+    # اختبار 2: كتابة 1 صف
+    try:
+        r = sb.table("candles").upsert({
+            "symbol": "__STRESS__",
+            "open_time": 999999,
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "volume": 1.0, "quote_volume": 1.0, "taker_buy_base": 0.0,
+            "interval": "15m",
+        }).execute()
+        out["tests"].append({"name": "write_1", "ok": True})
+    except Exception as e:
+        out["tests"].append({
+            "name": "write_1",
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error": str(e)[:500],
+        })
+
+    # اختبار 3: كتابة 10 صفوف
+    try:
+        rows = [{
+            "symbol": "__STRESS__",
+            "open_time": 1000000 + i,
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "volume": 1.0, "quote_volume": 1.0, "taker_buy_base": 0.0,
+            "interval": "15m",
+        } for i in range(10)]
+        sb.table("candles").upsert(rows).execute()
+        out["tests"].append({"name": "write_10", "ok": True})
+    except Exception as e:
+        out["tests"].append({
+            "name": "write_10",
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error": str(e)[:500],
+        })
+
+    # اختبار 4: كتابة 100 صف
+    try:
+        rows = [{
+            "symbol": "__STRESS__",
+            "open_time": 2000000 + i,
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "volume": 1.0, "quote_volume": 1.0, "taker_buy_base": 0.0,
+            "interval": "15m",
+        } for i in range(100)]
+        sb.table("candles").upsert(rows).execute()
+        out["tests"].append({"name": "write_100", "ok": True})
+    except Exception as e:
+        out["tests"].append({
+            "name": "write_100",
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error": str(e)[:500],
+        })
+
+    # اختبار 5: كتابة 500 صف (نفس حجم جمع الشموع)
+    try:
+        rows = [{
+            "symbol": "__STRESS__",
+            "open_time": 3000000 + i,
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "volume": 1.0, "quote_volume": 1.0, "taker_buy_base": 0.0,
+            "interval": "15m",
+        } for i in range(500)]
+        sb.table("candles").upsert(rows).execute()
+        out["tests"].append({"name": "write_500", "ok": True})
+    except Exception as e:
+        out["tests"].append({
+            "name": "write_500",
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error": str(e)[:500],
+        })
+
+    # تنظيف
+    try:
+        sb.table("candles").delete().eq("symbol", "__STRESS__").execute()
+        out["cleanup"] = "ok"
+    except Exception as e:
+        out["cleanup"] = f"failed: {str(e)[:100]}"
+
+    return jsonify(out)
+    
 @app.route('/api/runs')
 def api_runs():
     """قائمة التشغيلات السابقة من Supabase"""
