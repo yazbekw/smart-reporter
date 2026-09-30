@@ -208,30 +208,107 @@ def fetch_vision_month(symbol, year, month, verbose=True):
 # ============================================================
 # حفظ في Supabase — مع logging مفصّل
 # ============================================================
-def save_candles(rows, batch_size=500, verbose=True):
-    """يُخزّن على دفعات — مع تسجيل كل خطأ"""
+def save_candles(rows, batch_size=200, verbose=True):
+    """
+    يحفظ الشموع في Supabase بطريقة آمنة:
+    - batch صغير (200 بدل 500)
+    - retry عند الفشل (3 محاولات)
+    - تنظيف القيم (NaN, inf)
+    - timeout طويل
+    - logging مفصّل
+    """
     if not rows:
         return 0
 
+    # 1. تنظيف القيم
+    cleaned = []
+    for r in rows:
+        try:
+            # تحقق من صحة القيم
+            vals = [r.get("open"), r.get("high"), r.get("low"),
+                    r.get("close"), r.get("volume"),
+                    r.get("quote_volume"), r.get("taker_buy_base")]
+            ok = True
+            for v in vals:
+                if v is None:
+                    continue
+                if isinstance(v, float):
+                    import math
+                    if math.isnan(v) or math.isinf(v):
+                        ok = False
+                        break
+            if not ok:
+                continue
+
+            # تحقق من open_time
+            ot = int(r.get("open_time", 0))
+            if ot <= 0 or ot > 9_999_999_999_999:
+                continue
+
+            cleaned.append({
+                "symbol": str(r["symbol"]),
+                "open_time": ot,
+                "open": float(r.get("open", 0)),
+                "high": float(r.get("high", 0)),
+                "low": float(r.get("low", 0)),
+                "close": float(r.get("close", 0)),
+                "volume": float(r.get("volume", 0)),
+                "quote_volume": float(r.get("quote_volume", 0)),
+                "taker_buy_base": float(r.get("taker_buy_base", 0)),
+                "interval": "15m",
+            })
+        except Exception:
+            continue
+
+    if verbose:
+        print(f"[SAVE] {len(rows)} صف → {len(cleaned)} صف بعد التنظيف")
+
+    if not cleaned:
+        return 0
+
+    # 2. الحفظ على دفعات صغيرة مع retry
     sb = _sb_client()
     total = 0
     failed = 0
 
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i + batch_size]
-        try:
-            res = sb.table("candles").upsert(batch).execute()
-            total += len(batch)
-            if verbose and (i // batch_size) % 5 == 0:
-                print(f"[SAVE] ✅ batch {i}-{i+len(batch)} ({total}/{len(rows)})")
-        except Exception as e:
-            failed += len(batch)
-            err_str = str(e)[:200]
-            print(f"[SAVE] ❌ batch {i}-{i+len(batch)}: {err_str}")
+    for i in range(0, len(cleaned), batch_size):
+        batch = cleaned[i:i + batch_size]
+        success = False
+
+        for attempt in range(3):
+            try:
+                sb.table("candles").upsert(batch).execute()
+                total += len(batch)
+                success = True
+                if verbose and (i // batch_size) % 10 == 0:
+                    print(f"[SAVE] ✅ {i+len(batch)}/{len(cleaned)}")
+                break
+            except Exception as e:
+                err_str = str(e)[:150]
+                if attempt < 2:
+                    if verbose:
+                        print(f"[SAVE] ⚠️ محاولة {attempt+1} فشلت: {err_str}")
+                    time.sleep(1.5 * (attempt + 1))  # exponential backoff
+                else:
+                    if verbose:
+                        print(f"[SAVE] ❌ فشل نهائي: {err_str}")
+                    failed += len(batch)
+
+        if not success and len(batch) > 50:
+            # محاولة أخيرة: اقسم إلى نصفين
+            if verbose:
+                print(f"[SAVE] 🔄 تقسيم الدفعة إلى نصفين...")
+            half = len(batch) // 2
+            for sub_batch in [batch[:half], batch[half:]]:
+                try:
+                    sb.table("candles").upsert(sub_batch).execute()
+                    total += len(sub_batch)
+                    failed -= len(sub_batch)
+                except Exception:
+                    pass
 
     if verbose:
         print(f"[SAVE] انتهى: نجح={total}, فشل={failed}")
-
     return total
 
 
