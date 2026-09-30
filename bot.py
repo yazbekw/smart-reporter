@@ -7,6 +7,8 @@ Smart Analyst — رأي المحلل + المصفوفة الإحصائية.
 - الدرجة المركبة + سياق اليوم + أوزان ديناميكية
 - توقع متعدد الآفاق (30د، ساعة، ساعتان)
 - أهداف الربح + احتمالية الانعكاس
+- نافذة زمنية للبحث عن الإشارات النشطة
+- منع تكرار الإشارة (Cooldown)
 """
 import os
 import threading
@@ -30,6 +32,9 @@ from matrix import (
 
 load_dotenv()
 
+# ============================================================
+# الإعدادات
+# ============================================================
 BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_REPORT_CHAT_ID")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -40,9 +45,13 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
            "XRP/USDT", "ADA/USDT", "AVAX/USDT", "DOGE/USDT"]
 
-HOURLY_MIN = 60
-ALERT_MIN = 5
-
+# الفواصل الزمنية
+HOURLY_MIN = 60                         # كل ساعة
+ALERT_MIN = 5                           # كل 5 دقائق
+ACTIVE_WINDOW_MIN = 30                  # نافذة البحث في hourly/alert
+NOW_WINDOW_MIN = 60                     # نافذة البحث في /now
+SYM_WINDOW_MIN = 120                    # نافذة البحث في /sym و /full
+SIGNAL_COOLDOWN_MIN = 60                # منع تكرار نفس الإشارة خلال X دقيقة
 
 # ============================================================
 # Logging
@@ -130,6 +139,119 @@ def _is_buy_state(state: str) -> bool:
 
 
 # ============================================================
+# جلب snapshots
+# ============================================================
+def get_latest_snapshot(symbol: str) -> dict | None:
+    """آخر snapshot فقط (بغض النظر عن الحالة)"""
+    try:
+        res = (
+            supabase.table("snapshots").select("*")
+            .eq("symbol", symbol)
+            .order("timestamp", desc=True)
+            .limit(1).execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.warning(f"get_latest_snapshot({symbol}): {e}")
+        return None
+
+
+def get_active_signal(symbol: str, minutes: int = ACTIVE_WINDOW_MIN) -> dict | None:
+    """
+    يبحث عن آخر snapshot فيه إشارة نشطة (ليس NO TRADE/WATCH)
+    خلال آخر N دقيقة.
+
+    - يقرأ كل snapshots النافذة
+    - يعيد الأقوى (بـ abs(total_score))
+    - إذا لا يوجد → None
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    try:
+        res = (
+            supabase.table("snapshots").select("*")
+            .eq("symbol", symbol)
+            .gte("timestamp", cutoff)
+            .order("timestamp", desc=True)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception as e:
+        logger.warning(f"get_active_signal({symbol}): {e}")
+        return None
+
+    # فلترة الإشارات النشطة
+    actives = [
+        r for r in rows
+        if r.get("state") and r.get("state") not in ("NO TRADE", "WATCH")
+    ]
+    if not actives:
+        return None
+
+    # الأقوى بـ abs(total_score)
+    actives.sort(key=lambda r: abs(r.get("total_score", 0)), reverse=True)
+    return actives[0]
+
+
+def get_all_active_signals(symbol: str, minutes: int = ACTIVE_WINDOW_MIN) -> list:
+    """يجلب كل الإشارات النشطة في النافذة (بدون فلترة)"""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    try:
+        res = (
+            supabase.table("snapshots").select("*")
+            .eq("symbol", symbol)
+            .gte("timestamp", cutoff)
+            .order("timestamp", desc=True)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception as e:
+        logger.warning(f"get_all_active_signals({symbol}): {e}")
+        return []
+
+    return [
+        r for r in rows
+        if r.get("state") and r.get("state") not in ("NO TRADE", "WATCH")
+    ]
+
+
+# ============================================================
+# منع تكرار الإشارة (Cooldown)
+# ============================================================
+# symbol -> (state, total_score, timestamp)
+_signal_cache: dict = {}
+
+
+def should_send_signal(symbol: str, snap: dict,
+                       cooldown_min: int = SIGNAL_COOLDOWN_MIN) -> bool:
+    """
+    يفحص إذا كان يجب إرسال الإشارة (لم تُرسل مؤخراً بنفس الحالة).
+    يحدّث الـ cache إذا وافق.
+    """
+    state = snap.get("state", "")
+    score = abs(snap.get("total_score", 0))
+    now = datetime.now(timezone.utc)
+
+    last = _signal_cache.get(symbol)
+    if last:
+        last_state, last_score, last_time = last
+        # نفس الحالة تقريباً؟
+        same_state = (last_state == state)
+        # الفرق في الدرجة صغير؟
+        close_score = abs(last_score - score) <= 3
+
+        if same_state and close_score:
+            elapsed = (now - last_time).total_seconds() / 60
+            if elapsed < cooldown_min:
+                logger.info(
+                    f"⏭️ [{_short(symbol)}] تخطي (مُرسل قبل {elapsed:.0f} دقيقة)"
+                )
+                return False
+
+    _signal_cache[symbol] = (state, score, now)
+    return True
+
+
+# ============================================================
 # بناء الرسالة المختصرة
 # ============================================================
 def build_short_signal(symbol: str, state: str, signal_conf: int,
@@ -149,19 +271,16 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
     if not action:
         return None
 
-    # النظام الجديد
     result = final_confidence(signal_conf, symbol, direction)
 
     lines = [action]
     lines.append(f"🎯 ثقة الإشارة: <b>{signal_conf}%</b>")
 
     if result.get("available"):
-        # تحذير المصدر
         source = result.get("source", "?")
         if source == "__combined__":
             lines.append(f"⚠️ <i>لا توجد بيانات {_short(symbol)} — متوسط السوق</i>")
 
-        # اتجاه المصفوفة
         is_buy = _is_buy_state(state)
         direction_label = "احتمال صعود" if is_buy else "احتمال هبوط"
 
@@ -170,7 +289,6 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
         )
         lines.append(f"⚡ <b>القرار النهائي: {result['final']}%</b>")
 
-        # ✨ توقع المدى المتوسط
         forecast = result.get("forecast")
         if forecast and forecast.get("available"):
             h1 = forecast["horizons"]["1h"]
@@ -183,11 +301,9 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
                 f"انعكاس: {forecast['reversal_prob']:.0f}%"
             )
 
-        # تحذير إذا التوافق منخفض
         if result["composite_adjusted"] < 45:
             lines.append("🚨 <b>تحذير: المصفوفة لا تدعم الإشارة!</b>")
 
-        # سياق اليوم
         day_ctx = result.get("day_ctx")
         if day_ctx and day_ctx.get("bias") != "neutral":
             lines.append(
@@ -195,7 +311,6 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
                 f"<i>{day_ctx['bias']}</i>"
             )
 
-        # تفاصيل كاملة
         if full_details:
             raw = result.get("raw", {})
             lines.append("")
@@ -242,19 +357,6 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
 
 
 # ============================================================
-# الفحص الأساسي
-# ============================================================
-def get_latest_snapshot(symbol: str) -> dict | None:
-    res = (
-        supabase.table("snapshots").select("*")
-        .eq("symbol", symbol)
-        .order("timestamp", desc=True)
-        .limit(1).execute()
-    )
-    return res.data[0] if res.data else None
-
-
-# ============================================================
 # Handlers
 # ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -281,17 +383,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فحص فوري — يستخدم نافذة 60 دقيقة"""
     await update.message.reply_text("⏳ جاري الفحص...")
     sent = 0
+    checked = 0
+
     for symbol in SYMBOLS:
-        snap = get_latest_snapshot(symbol)
+        # ✅ البحث عن إشارات نشطة في آخر 60 دقيقة
+        snap = get_active_signal(symbol, minutes=NOW_WINDOW_MIN)
+        checked += 1
+
         if not snap:
             continue
 
         state = snap.get("state", "NO TRADE")
-        if state in ("NO TRADE", "WATCH"):
-            continue
-
         conf = _confidence(snap)
         direction = "LONG" if _is_buy_state(state) else "SHORT"
         msg = build_short_signal(symbol, state, conf, direction, full_details=True)
@@ -301,7 +406,11 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent += 1
 
     if sent == 0:
-        await update.message.reply_text("لا توجد إشارات نشطة حالياً.")
+        await update.message.reply_text(
+            f"⚪ لا توجد إشارات نشطة خلال آخر {NOW_WINDOW_MIN} دقيقة.\n"
+            f"<i>تم فحص {checked} عملة.</i>",
+            parse_mode="HTML",
+        )
 
 
 async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -313,7 +422,13 @@ async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "/" not in sym:
         sym = sym + "/USDT"
 
-    snap = get_latest_snapshot(sym)
+    # نحاول أولاً الإشارة النشطة
+    snap = get_active_signal(sym, minutes=SYM_WINDOW_MIN)
+
+    # fallback: آخر snapshot
+    if not snap:
+        snap = get_latest_snapshot(sym)
+
     if not snap:
         await update.message.reply_text(f"❌ لا توجد بيانات لـ {sym}")
         return
@@ -357,7 +472,6 @@ async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     comp_short = matrix_composite_score(sym, "SHORT", now)
     day_ctx = day_context(sym, dt=now)
 
-    # توقع متعدد الآفاق
     fc = final_confidence(0, sym, "LONG", dt=now)
     forecast = fc.get("forecast") if fc.get("available") else None
 
@@ -414,7 +528,7 @@ async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = context.args[0].upper()
         sym = s if "/" in s else s + "/USDT"
 
-    snap = get_latest_snapshot(sym)
+    snap = get_active_signal(sym, minutes=SYM_WINDOW_MIN) or get_latest_snapshot(sym)
     if not snap:
         await update.message.reply_text(f"❌ لا توجد بيانات لـ {sym}")
         return
@@ -437,24 +551,54 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"<code>{safe}</code>", parse_mode="HTML")
 
 
+async def cmd_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعرض حالة آخر 30 دقيقة لكل عملة"""
+    now = datetime.now(timezone.utc)
+    lines = [f"🔍 <b>حالة آخر {ACTIVE_WINDOW_MIN} دقيقة</b>\n"]
+    for symbol in SYMBOLS:
+        actives = get_all_active_signals(symbol, ACTIVE_WINDOW_MIN)
+        latest = get_latest_snapshot(symbol)
+
+        latest_state = latest.get("state", "?") if latest else "—"
+        latest_ts = latest.get("timestamp", "")[:19] if latest else "—"
+
+        if actives:
+            best = max(actives, key=lambda r: abs(r.get("total_score", 0)))
+            lines.append(
+                f"✅ <b>{_short(symbol)}</b>: {len(actives)} إشارة نشطة | "
+                f"أقوى: {best.get('state')} ({best.get('total_score')})"
+            )
+        else:
+            lines.append(
+                f"⚪ <b>{_short(symbol)}</b>: لا نشطة | "
+                f"آخر: {latest_state}"
+            )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 # ============================================================
 # Scheduled Jobs
 # ============================================================
 async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
-    """كل ساعة — رسائل مختصرة لكل إشارة نشطة"""
-    print(f"⏰ [HOURLY] {datetime.now(timezone.utc).strftime('%H:%M')}")
+    """كل ساعة — يبحث عن إشارات نشطة في آخر 30 دقيقة"""
+    print(f"\n⏰ [HOURLY] {datetime.now(timezone.utc).strftime('%H:%M')}")
     sent = 0
+    skipped = 0
 
     for symbol in SYMBOLS:
         try:
-            snap = get_latest_snapshot(symbol)
+            # ✅ البحث عن إشارة نشطة (ليس NO TRADE)
+            snap = get_active_signal(symbol, minutes=ACTIVE_WINDOW_MIN)
             if not snap:
                 continue
 
-            state = snap.get("state", "NO TRADE")
-            if state in ("NO TRADE", "WATCH"):
+            # ✅ منع التكرار
+            if not should_send_signal(symbol, snap):
+                skipped += 1
                 continue
 
+            state = snap.get("state", "NO TRADE")
             conf = _confidence(snap)
             direction = "LONG" if _is_buy_state(state) else "SHORT"
             msg = build_short_signal(symbol, state, conf, direction)
@@ -466,59 +610,63 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
                 sent += 1
-                print(f"✅ [{symbol}] أُرسل")
+                print(f"✅ [{symbol}] {state} (score={snap.get('total_score')}) → أُرسل")
         except Exception as e:
             print(f"❌ [{symbol}] {e}")
 
     if sent == 0:
-        print("⚠️ لا توجد إشارات في هذه الساعة")
-
-
-_state_cache = {}
+        print(f"⚠️ لا إشارات جديدة (تخطي: {skipped})")
 
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    """فحص التغيرات كل 5 دقائق"""
+    """كل 5 دقائق — يبحث عن تغيير في الإشارات النشطة"""
     try:
-        res = (
-            supabase.table("snapshots").select("*")
-            .order("timestamp", desc=True)
-            .limit(40).execute()
-        )
-        rows = res.data or []
+        for symbol in SYMBOLS:
+            snap = get_active_signal(symbol, minutes=ACTIVE_WINDOW_MIN)
+            if not snap:
+                # لا إشارة نشطة → نمسح الكاش
+                _state_cache.pop(symbol, None)
+                continue
 
-        latest = {}
-        for r in rows:
-            s = r["symbol"]
-            if s not in latest:
-                latest[s] = r
-
-        for symbol, snap in latest.items():
             state = snap.get("state")
-            score = snap.get("total_score", 0)
+            score = abs(snap.get("total_score", 0))
             last = _state_cache.get(symbol)
 
-            if last and last[0] != state:
-                if state in ("STRONG BUY SETUP", "BUY SETUP",
-                             "STRONG SELL SETUP", "SELL SETUP",
-                             "EARLY BUY", "EARLY SELL"):
-                    conf = _confidence(snap)
-                    direction = "LONG" if _is_buy_state(state) else "SHORT"
-                    msg = build_short_signal(symbol, state, conf, direction)
+            # إشارة جديدة أو تغيّرت بشكل كبير؟
+            is_new = (last is None)
+            changed = (last is not None and last[0] != state)
 
-                    if msg and CHAT_ID:
+            if is_new or changed:
+                # منع التكرار
+                if not should_send_signal(symbol, snap, cooldown_min=30):
+                    _state_cache[symbol] = (state, score)
+                    continue
+
+                conf = _confidence(snap)
+                direction = "LONG" if _is_buy_state(state) else "SHORT"
+                msg = build_short_signal(symbol, state, conf, direction)
+
+                if msg and CHAT_ID:
+                    if is_new:
+                        header = f"🆕 <b>إشارة جديدة — {_short(symbol)}</b>\n\n"
+                    else:
                         header = f"⚡ <b>تغير مفاجئ — {_short(symbol)}</b>\n"
                         header += f"<i>{last[0]} → {state}</i>\n\n"
-                        await context.bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=header + msg,
-                            parse_mode="HTML",
-                        )
-                        print(f"⚡ [{symbol}] {last[0]} → {state}")
+
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=header + msg,
+                        parse_mode="HTML",
+                    )
+                    print(f"{'🆕' if is_new else '⚡'} [{symbol}] {state}")
 
             _state_cache[symbol] = (state, score)
     except Exception as e:
         print(f"[alert_job] {e}")
+
+
+# cache للإشارات السابقة في alert_job
+_state_cache: dict = {}
 
 
 # ============================================================
@@ -549,6 +697,8 @@ def _run_health():
 def main():
     threading.Thread(target=_run_health, daemon=True).start()
     print("🧠 Analyst Bot + Matrix يبدأ...")
+    print(f"🔎 نافذة البحث: {ACTIVE_WINDOW_MIN} دقيقة")
+    print(f"🚫 منع التكرار: {SIGNAL_COOLDOWN_MIN} دقيقة")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -559,6 +709,7 @@ def main():
     app.add_handler(CommandHandler("matrix", cmd_matrix))
     app.add_handler(CommandHandler("full", cmd_full))
     app.add_handler(CommandHandler("raw", cmd_raw))
+    app.add_handler(CommandHandler("cache", cmd_cache))
     app.add_error_handler(error_handler)
 
     # Jobs
@@ -569,7 +720,7 @@ def main():
         app.job_queue.run_repeating(
             alert_job, interval=ALERT_MIN * 60, first=30, name="alerts"
         )
-        print(f"⏰ كل {HOURLY_MIN} دقيقة: رسائل مختصرة")
+        print(f"⏰ كل {HOURLY_MIN} دقيقة: فحص الإشارات")
         print(f"⚡ كل {ALERT_MIN} دقائق: تغيرات مفاجئة")
 
     print("✅ Bot جاهز")
