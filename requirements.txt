@@ -3,3 +3,5 @@ supabase==2.9.1
 python-dotenv==1.0.1
 requests>=2.31.0
 Flask>=3.0.0
+ccxt>=4.4.0
+pandas>=2.2.0
