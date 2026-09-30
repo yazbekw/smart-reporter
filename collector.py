@@ -353,19 +353,19 @@ def api_cache_status():
     return jsonify(out)
 
 
-@app.route('/api/collect', methods=['POST'])
+@app.route('/api/collect', methods=['GET', 'POST'])
 def api_collect():
     ok, msg = _start_job("collect")
     return jsonify({"ok": ok, "msg": msg})
 
 
-@app.route('/api/build', methods=['POST'])
+@app.route('/api/build', methods=['GET', 'POST'])
 def api_build():
     ok, msg = _start_job("build")
     return jsonify({"ok": ok, "msg": msg})
 
 
-@app.route('/api/run', methods=['POST'])
+@app.route('/api/run', methods=['GET', 'POST'])
 def api_run():
     ok, msg = _start_job("run")
     return jsonify({"ok": ok, "msg": msg})
