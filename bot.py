@@ -1,10 +1,14 @@
 """
 Smart Analyst — رأي المحلل + المصفوفة الإحصائية.
 نسخة مخففة: نافذة أوسع + منع تكرار أقل صرامة + تشخيص مدمج
++ ميزة تقاطع EMA (مستقلة تماماً)
 """
 import os
 import threading
 import logging
+import ccxt                     # ═══ إضافة جديدة ═══
+import pandas as pd             # ═══ إضافة جديدة ═══
+import asyncio                  # ═══ إضافة جديدة ═══
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -45,6 +49,14 @@ NOW_WINDOW_MIN = 180            # 3 ساعات
 SYM_WINDOW_MIN = 360            # 6 ساعات
 SIGNAL_COOLDOWN_MIN = 15        # 15 دقيقة
 SCORE_CHANGE_THRESHOLD = 5      # تغير الدرجة
+
+# ════════════════════════════════════════════════════════════
+# ═══ إضافة جديدة: إعدادات ميزة تقاطع EMA ═══
+# ════════════════════════════════════════════════════════════
+CROSSOVER_TIMEFRAME = "15m"
+CROSSOVER_EMA_FAST = 7
+CROSSOVER_EMA_SLOW = 25
+CROSSOVER_JOB_INTERVAL_MIN = 5
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -182,6 +194,17 @@ def get_all_active_signals(symbol: str, minutes: int = ACTIVE_WINDOW_MIN) -> lis
 # ============================================================
 _signal_cache: dict = {}
 
+# ════════════════════════════════════════════════════════════
+# ═══ إضافة جديدة: ذاكرة تقاطعات EMA + تهيئة المنصة ═══
+# ════════════════════════════════════════════════════════════
+_crossover_cache: dict = {}   # {symbol: {"direction": ..., "candle_ts": ...}}
+
+try:
+    _exchange = ccxt.binance({"enableRateLimit": True})
+except Exception as _e:
+    logger.warning(f"ccxt init failed: {_e}")
+    _exchange = None
+
 
 def should_send_signal(symbol: str, snap: dict,
                        cooldown_min: int = SIGNAL_COOLDOWN_MIN) -> bool:
@@ -265,6 +288,170 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
     return "\n".join(lines)
 
 
+# ════════════════════════════════════════════════════════════
+# ═══ إضافة جديدة: ميزة تقاطع EMA — دوال مستقلة ═══
+# ════════════════════════════════════════════════════════════
+async def detect_crossover(symbol: str, timeframe: str = CROSSOVER_TIMEFRAME) -> dict | None:
+    """
+    تكتشف تقاطع EMA السريع مع EMA البطيء في آخر شمعة مغلقة.
+    ترجع dict عند وجود تقاطع جديد، أو None.
+    """
+    if _exchange is None:
+        return None
+    try:
+        ohlcv = await asyncio.to_thread(
+            _exchange.fetch_ohlcv, symbol, timeframe, limit=120
+        )
+        if not ohlcv or len(ohlcv) < CROSSOVER_EMA_SLOW + 5:
+            return None
+
+        df = pd.DataFrame(
+            ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
+        )
+        df["ema_fast"] = df["close"].ewm(span=CROSSOVER_EMA_FAST, adjust=False).mean()
+        df["ema_slow"] = df["close"].ewm(span=CROSSOVER_EMA_SLOW, adjust=False).mean()
+
+        # نستخدم الشمعة المغلقة الأخيرة (-2) لتجنب إشارات وهمية
+        curr = -2
+        prev = -3
+
+        cf, cs = df["ema_fast"].iloc[curr], df["ema_slow"].iloc[curr]
+        pf, ps = df["ema_fast"].iloc[prev], df["ema_slow"].iloc[prev]
+
+        bullish = (cf > cs) and (pf <= ps)
+        bearish = (cf < cs) and (pf >= ps)
+        if not (bullish or bearish):
+            return None
+
+        direction = "bullish" if bullish else "bearish"
+        candle_ts = int(df["timestamp"].iloc[curr])
+
+        last = _crossover_cache.get(symbol)
+        if last and last.get("candle_ts") == candle_ts and last.get("direction") == direction:
+            return None
+
+        _crossover_cache[symbol] = {"direction": direction, "candle_ts": candle_ts}
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "ema_fast": round(float(cf), 4),
+            "ema_slow": round(float(cs), 4),
+            "price": round(float(df["close"].iloc[curr]), 4),
+            "candle_ts": candle_ts,
+            "timeframe": timeframe,
+        }
+    except Exception as e:
+        logger.warning(f"detect_crossover({symbol}): {e}")
+        return None
+
+
+def build_crossover_message(cross: dict) -> str:
+    """
+    تبني رسالة التقاطع، مدموجة مع بيانات Supabase والمصفوفة.
+    """
+    symbol = cross["symbol"]
+    short = _short(symbol)
+    is_bull = (cross["direction"] == "bullish")
+    dir_str = "LONG" if is_bull else "SHORT"
+
+    # وقت الشمعة
+    try:
+        candle_time = datetime.fromtimestamp(
+            cross["candle_ts"] / 1000, tz=timezone.utc
+        ).strftime("%H:%M UTC")
+    except Exception:
+        candle_time = "?"
+
+    # ====== العنوان ======
+    if is_bull:
+        lines = [f"🚀 <b>إشارة تقاطع EMA — {short}</b>", "━━━━━━━━━━━━━━━━━━━"]
+        lines.append("📈 <b>التقاطع: صاعد 🟢</b>")
+    else:
+        lines = [f"🔻 <b>إشارة تقاطع EMA — {short}</b>", "━━━━━━━━━━━━━━━━━━━"]
+        lines.append("📉 <b>التقاطع: هابط 🔴</b>")
+
+    # ====== تفاصيل التقاطع ======
+    lines.append(
+        f"• EMA{CROSSOVER_EMA_FAST}: {cross['ema_fast']} | "
+        f"EMA{CROSSOVER_EMA_SLOW}: {cross['ema_slow']}"
+    )
+    lines.append(f"• السعر عند الإغلاق: {cross['price']}")
+    lines.append(f"• الفريم: {cross['timeframe']}")
+    lines.append(f"• وقت الشمعة: {candle_time}")
+
+    # ====== القسم 1: قاعدة البيانات ======
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append("🗄️ <b>من قاعدة البيانات:</b>")
+
+    snap = get_latest_snapshot(symbol)
+    signal_conf = 0
+    if snap:
+        state = snap.get("state", "NO TRADE")
+        score = snap.get("total_score", 0)
+        signal_conf = _confidence(snap)
+        lines.append(f"• الحالة: {state}")
+        lines.append(f"• الدرجة: {score}")
+        lines.append(f"• الثقة: <b>{signal_conf}%</b>")
+    else:
+        lines.append("• <i>لا يوجد snapshot حديث</i>")
+
+    # ====== القسم 2: المصفوفة ======
+    lines.append("")
+    lines.append("📊 <b>من المصفوفة:</b>")
+
+    result = final_confidence(signal_conf, symbol, dir_str)
+    matrix_ok = False
+
+    if result.get("available"):
+        source = result.get("source", "?")
+        if source == "__combined__":
+            lines.append(f"⚠️ <i>لا توجد بيانات {short} — متوسط السوق</i>")
+
+        direction_label = "احتمال صعود" if is_bull else "احتمال هبوط"
+        composite = result["composite_adjusted"]
+        lines.append(f"• توافق المصفوفة: <b>{composite}%</b> ({direction_label})")
+        lines.append(f"• القرار النهائي: <b>{result['final']}%</b>")
+
+        forecast = result.get("forecast")
+        if forecast and forecast.get("available"):
+            h1 = forecast["horizons"]["1h"]
+            lines.append(
+                f"• 🔮 توقع ساعة: <b>{h1['expected']:+.3f}%</b> "
+                f"(نجاح {h1['window_wr']:.0f}%)"
+            )
+            lines.append(
+                f"• 🎯 هدف +0.5%: <b>{forecast['target_hit_0_5']:.0f}%</b> | "
+                f"انعكاس: {forecast['reversal_prob']:.0f}%"
+            )
+
+        day_ctx = result.get("day_ctx")
+        if day_ctx and day_ctx.get("bias") != "neutral":
+            lines.append(
+                f"• {day_ctx['emoji']} سياق اليوم ({day_ctx['day_name']}): "
+                f"<i>{day_ctx['bias']}</i>"
+            )
+
+        matrix_ok = composite >= 55 and result["final"] >= 60
+    else:
+        lines.append(f"• <i>{result.get('reason', 'لا بيانات')}</i>")
+
+    # ====== الخلاصة ======
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append("⚖️ <b>الخلاصة:</b>")
+
+    if matrix_ok:
+        lines.append("التقاطع الفني ✅ + دعم المصفوفة ✅ (متوافق)")
+    elif result.get("available"):
+        lines.append("التقاطع الفني ✅ + دعم المصفوفة ⚠️ (ضعيف)")
+    else:
+        lines.append("التقاطع الفني ✅ + المصفوفة ❓ (لا بيانات)")
+
+    return "\n".join(lines)
+
+
 # ============================================================
 # Handlers
 # ============================================================
@@ -283,7 +470,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/matrix BTC — إحصاء المصفوفة\n"
         "/full BTC — تقرير غني\n"
         "/test — 🔍 تشخيص مفصل\n"
-        "/raw — تشخيص المصفوفة"
+        "/raw — تشخيص المصفوفة\n"
+        "/cross — 🔀 فحص تقاطعات EMA"     # ═══ إضافة جديدة ═══
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -459,6 +647,27 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"<code>{safe}</code>", parse_mode="HTML")
 
 
+# ════════════════════════════════════════════════════════════
+# ═══ إضافة جديدة: أمر /cross للفحص اليدوي ═══
+# ════════════════════════════════════════════════════════════
+async def cmd_cross(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فحص تقاطعات EMA يدوياً (يتجاهل الذاكرة)"""
+    await update.message.reply_text("🔍 جاري فحص التقاطعات...")
+    found = 0
+    for symbol in SYMBOLS:
+        _crossover_cache.pop(symbol, None)  # تجاهل الذاكرة
+        cross = await detect_crossover(symbol, CROSSOVER_TIMEFRAME)
+        if cross:
+            msg = build_crossover_message(cross)
+            if msg:
+                await update.message.reply_text(msg, parse_mode="HTML")
+                found += 1
+    if found == 0:
+        await update.message.reply_text(
+            f"⚪ لا توجد تقاطعات جديدة على فريم {CROSSOVER_TIMEFRAME}"
+        )
+
+
 # ============================================================
 # Jobs
 # ============================================================
@@ -543,6 +752,39 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         print(f"[alert_job] {e}")
 
 
+# ════════════════════════════════════════════════════════════
+# ═══ إضافة جديدة: Job مستقل لفحص تقاطعات EMA ═══
+# ════════════════════════════════════════════════════════════
+async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job مستقل يفحص تقاطعات EMA كل 5 دقائق على جميع العملات.
+    لا يتدخل في alert_job أو hourly_job.
+    """
+    try:
+        found = 0
+        for symbol in SYMBOLS:
+            cross = await detect_crossover(symbol, CROSSOVER_TIMEFRAME)
+            if not cross:
+                continue
+
+            msg = build_crossover_message(cross)
+            if msg and CHAT_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID, text=msg, parse_mode="HTML"
+                    )
+                    emoji = "🚀" if cross["direction"] == "bullish" else "🔻"
+                    print(f"{emoji} [CROSSOVER] {symbol} → {cross['direction']}")
+                    found += 1
+                except Exception as e:
+                    print(f"❌ إرسال تقاطع {symbol}: {e}")
+
+        if found:
+            print(f"📊 تقاطعات مرسلة: {found}")
+    except Exception as e:
+        print(f"[crossover_job] {e}")
+
+
 # ============================================================
 # Health Server
 # ============================================================
@@ -582,12 +824,21 @@ def main():
     app.add_handler(CommandHandler("full", cmd_full))
     app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("test", cmd_test))   # ← جديد
+    app.add_handler(CommandHandler("cross", cmd_cross)) # ═══ إضافة جديدة ═══
     app.add_error_handler(error_handler)
 
     if app.job_queue:
         app.job_queue.run_repeating(hourly_job, interval=HOURLY_MIN * 60, first=10, name="hourly")
         app.job_queue.run_repeating(alert_job, interval=ALERT_MIN * 60, first=30, name="alerts")
+        # ═══ إضافة جديدة: Job مستقل لتقاطعات EMA ═══
+        app.job_queue.run_repeating(
+            crossover_job,
+            interval=CROSSOVER_JOB_INTERVAL_MIN * 60,
+            first=60,
+            name="crossover",
+        )
         print(f"⏰ hourly كل {HOURLY_MIN}د | alerts كل {ALERT_MIN}د")
+        print(f"🔀 crossover كل {CROSSOVER_JOB_INTERVAL_MIN}د | فريم {CROSSOVER_TIMEFRAME}") # ═══ إضافة جديدة ═══
 
     print("✅ جاهز")
     app.run_polling(
