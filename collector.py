@@ -541,7 +541,84 @@ def api_run_detail(run_id):
         return jsonify({"ok": True, "run": res.data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+@app.route('/api/test_fetch')
+def api_test_fetch():
+    """يختبر جلب شهر واحد من Binance Vision + حفظه"""
+    import time
+    import traceback
+    out = {"steps": []}
 
+    # 1. اختبار جلب BTC شهر واحد
+    t0 = time.time()
+    try:
+        from backtest_data import fetch_vision_month
+        rows = fetch_vision_month("BTCUSDT", 2026, 6, verbose=True)
+        elapsed = time.time() - t0
+        out["steps"].append({
+            "name": "fetch_month",
+            "ok": len(rows) > 0,
+            "rows": len(rows),
+            "seconds": round(elapsed, 2),
+        })
+    except Exception as e:
+        out["steps"].append({
+            "name": "fetch_month",
+            "ok": False,
+            "error": f"{type(e).__name__}: {str(e)[:300]}",
+            "trace": traceback.format_exc()[-500:],
+            "seconds": round(time.time() - t0, 2),
+        })
+        return jsonify(out)
+
+    # 2. اختبار حفظ 2880 صف (شهر كامل)
+    t0 = time.time()
+    try:
+        from backtest_data import save_candles
+        saved = save_candles(rows[:1000], verbose=True)
+        elapsed = time.time() - t0
+        out["steps"].append({
+            "name": "save_1000",
+            "ok": saved == 1000,
+            "saved": saved,
+            "seconds": round(elapsed, 2),
+        })
+    except Exception as e:
+        out["steps"].append({
+            "name": "save_1000",
+            "ok": False,
+            "error": f"{type(e).__name__}: {str(e)[:300]}",
+            "trace": traceback.format_exc()[-500:],
+        })
+
+    # 3. اختبار حفظ الشهر كامل (2880)
+    t0 = time.time()
+    try:
+        from backtest_data import save_candles
+        saved = save_candles(rows, verbose=False)
+        elapsed = time.time() - t0
+        out["steps"].append({
+            "name": "save_full_month",
+            "ok": saved == len(rows),
+            "expected": len(rows),
+            "saved": saved,
+            "seconds": round(elapsed, 2),
+        })
+    except Exception as e:
+        out["steps"].append({
+            "name": "save_full_month",
+            "ok": False,
+            "error": f"{type(e).__name__}: {str(e)[:300]}",
+        })
+
+    # تنظيف
+    try:
+        from backtest_data import _sb_client
+        _sb_client().table("candles").delete().eq("symbol", "BTCUSDT").execute()
+        out["cleanup"] = "ok"
+    except Exception as e:
+        out["cleanup"] = str(e)[:200]
+
+    return jsonify(out)
 
 @app.route('/api/run/<int:run_id>/trades')
 def api_run_trades_csv(run_id):
