@@ -1,8 +1,19 @@
 """
-backtest_data.py — جلب وتخزين الشموع مع تشخيص كامل
+backtest_data.py
+================
+جلب وتخزين الشموع التاريخية في Supabase
+
+التحسينات:
+- timeout أطول لـ Supabase (120 ثانية)
+- batch_size صغير (200) لتجنب الفشل
+- Retry تلقائي عند فشل أي batch
+- تنظيف القيم (NaN, inf)
+- إعادة إنشاء Supabase client دورياً
+- Logging مفصّل
 """
 import io
 import time
+import math
 import zipfile
 import requests
 from datetime import datetime, timezone, timedelta
@@ -11,31 +22,68 @@ from backtest_config import CFG
 
 VISION_BASE = "https://data.binance.vision/data/spot/monthly/klines"
 
+# إعدادات الحفظ
+SAVE_BATCH_SIZE = 200           # عدد الصفوف لكل دفعة
+SAVE_RETRIES = 3                # عدد محاولات إعادة الإرسال
+CLIENT_RESET_EVERY = 30         # إعادة إنشاء client كل N دفعة
+VISION_TIMEOUT = 120            # ثوانٍ لجلب ملف ZIP
+SUPABASE_TIMEOUT = 120          # ثوانٍ لعمليات Supabase
+
 _sb = None
+_sb_batches_since_reset = 0
 
+
+# ============================================================
+# Supabase Client
+# ============================================================
 def _sb_client():
-    global _sb
-    if _sb is None:
-        url = CFG["SUPABASE_URL"]
-        key = CFG["SUPABASE_KEY"]
-        print(f"[SB] URL: {url[:40]}...")
-        print(f"[SB] Key: {key[:25]}... (len={len(key)})")
+    """
+    يبني Supabase client مع timeout أطول.
+    يعيد الاستخدام ما لم يُطلب reset.
+    """
+    global _sb, _sb_batches_since_reset
 
-        # ✅ إضافة timeout طويل
-        try:
-            from supabase import create_client, ClientOptions
-            options = ClientOptions(
-                postgrest_client_timeout=60,     # 60 ثانية بدل 10
-                storage_client_timeout=60,
-            )
-            _sb = create_client(url, key, options=options)
-        except (ImportError, TypeError):
-            # fallback لإصدارات أقدم
-            _sb = create_client(url, key)
+    if _sb is not None:
+        return _sb
+
+    url = CFG["SUPABASE_URL"]
+    key = CFG["SUPABASE_KEY"]
+
+    if not url or not key:
+        raise RuntimeError("SUPABASE_URL أو SUPABASE_KEY مفقود")
+
+    print(f"[SB] init: {url[:50]}... key_len={len(key)}")
+
+    # محاولة 1: استخدام ClientOptions مع timeout مخصص
+    try:
+        from supabase import ClientOptions
+        options = ClientOptions(
+            postgrest_client_timeout=SUPABASE_TIMEOUT,
+        )
+        _sb = create_client(url, key, options=options)
+        print(f"[SB] ✅ ClientOptions (timeout={SUPABASE_TIMEOUT}s)")
+    except (ImportError, TypeError):
+        # محاولة 2: بدون options
+        _sb = create_client(url, key)
+        print("[SB] ⚠️ بدون ClientOptions (timeout افتراضي)")
+
+    _sb_batches_since_reset = 0
     return _sb
 
 
+def _reset_sb_client():
+    """يعيد إنشاء client لتجنب connection pool issues"""
+    global _sb, _sb_batches_since_reset
+    _sb = None
+    _sb_batches_since_reset = 0
+    print("[SB] 🔄 reset client")
+
+
+# ============================================================
+# أدوات
+# ============================================================
 def _normalize_ts(ts):
+    """يوحّد أطوال أرقام Unix timestamps"""
     ts = int(ts)
     if ts > 10**17: return ts // 1_000_000
     if ts > 10**14: return ts // 1_000_000_000
@@ -43,42 +91,49 @@ def _normalize_ts(ts):
     return ts
 
 
+def _is_finite_number(v):
+    """يتحقق أن القيمة رقم صالح (ليس NaN/Inf/None)"""
+    if v is None:
+        return False
+    try:
+        f = float(v)
+        return math.isfinite(f)
+    except (TypeError, ValueError):
+        return False
+
+
 # ============================================================
-# تشخيص الجدول
+# تشخيص
 # ============================================================
 def diagnose_table():
-    """يتحقق من وجود جدول candles وإمكانية الكتابة"""
-    sb = _sb_client()
+    """يتحقق من الجدول + الكتابة"""
     result = {"ok": False, "issues": [], "info": {}}
 
-    # 1. هل الجدول موجود؟
     try:
-        res = sb.table("candles").select("symbol").limit(1).execute()
+        sb = _sb_client()
+        sb.table("candles").select("symbol").limit(1).execute()
         result["info"]["table_exists"] = True
-        result["info"]["existing_rows"] = "unknown (res.data length)"
         print("[DIAG] ✅ جدول candles موجود")
     except Exception as e:
-        result["issues"].append(f"جدول غير موجود أو خطأ: {e}")
-        print(f"[DIAG] ❌ جدول candles: {e}")
+        result["issues"].append(f"جدول: {e}")
+        print(f"[DIAG] ❌ جدول: {e}")
         return result
 
-    # 2. اختبار كتابة
-    test_row = {
-        "symbol": "__TEST__",
-        "open_time": 0,
-        "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0,
-        "volume": 0.0, "quote_volume": 0.0, "taker_buy_base": 0.0,
-        "interval": "15m",
-    }
     try:
-        sb.table("candles").upsert(test_row).execute()
-        print("[DIAG] ✅ الكتابة تعمل")
-        # نظّف
-        sb.table("candles").delete().eq("symbol", "__TEST__").execute()
+        sb.table("candles").upsert({
+            "symbol": "__DIAG__",
+            "open_time": 1,
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "volume": 1.0, "quote_volume": 1.0, "taker_buy_base": 0.0,
+            "interval": "15m",
+        }).execute()
+        sb.table("candles").delete().eq("symbol", "__DIAG__").execute()
         result["ok"] = True
+        result["info"]["write_test"] = "ok"
+        print("[DIAG] ✅ الكتابة تعمل")
     except Exception as e:
-        result["issues"].append(f"فشل الكتابة: {e}")
-        print(f"[DIAG] ❌ الكتابة: {e}")
+        result["issues"].append(f"كتابة: {e}")
+        print(f"[DIAG] ❌ كتابة: {e}")
 
     return result
 
@@ -101,20 +156,23 @@ def _cache_count(symbol, days):
         )
         return res.count or 0
     except Exception as e:
-        print(f"[cache_count] {symbol}: {e}")
+        print(f"[count] {symbol}: {e}")
         return 0
 
 
 def cache_has_data(symbol, days):
+    """يتحقق أن البيانات كافية في cache"""
     n = _cache_count(symbol, days)
     need = days * 90
-    print(f"[cache] {symbol}: {n} شمعة (المطلوب ≥ {need})")
+    print(f"[cache] {symbol}: {n} شمعة (يحتاج ≥ {need})")
     return n >= need
 
 
 def load_candles(symbol, days=None):
+    """يقرأ الشموع من Supabase (مع pagination)"""
     if days is None:
         days = CFG["DAYS"]
+
     sb = _sb_client()
     cutoff = int(
         (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
@@ -123,6 +181,7 @@ def load_candles(symbol, days=None):
     all_rows = []
     page_size = 1000
     offset = 0
+
     while True:
         try:
             res = (
@@ -135,17 +194,19 @@ def load_candles(symbol, days=None):
                 .execute()
             )
         except Exception as e:
-            print(f"[load_candles] {symbol} page {offset}: {e}")
+            print(f"[load] {symbol} offset={offset}: {e}")
             break
+
         rows = res.data or []
         if not rows:
             break
+
         all_rows.extend(rows)
         if len(rows) < page_size:
             break
         offset += page_size
 
-    print(f"[load_candles] {symbol}: {len(all_rows)} شمعة")
+    print(f"[load] {symbol}: {len(all_rows)} شمعة")
     return all_rows
 
 
@@ -153,33 +214,60 @@ def load_candles(symbol, days=None):
 # جلب من Binance Vision
 # ============================================================
 def fetch_vision_month(symbol, year, month, verbose=True):
-    """يجلب ملف شهر واحد — مع logging مفصّل"""
+    """
+    يجلب ملف شهر واحد من Binance Vision.
+    - timeout: 120 ثانية
+    - retry: 3 محاولات عند الفشل
+    - يعيد list of dicts (بدون كتابة)
+    """
     fname = f"{symbol}-15m-{year}-{month:02d}.zip"
     url = f"{VISION_BASE}/{symbol}/15m/{fname}"
 
     if verbose:
-        print(f"[VISION] GET {url}")
+        print(f"[VISION] {symbol} {year}-{month:02d} ...")
 
-    try:
-        r = requests.get(url, timeout=60)
-        if verbose:
-            print(f"[VISION] HTTP {r.status_code}, size={len(r.content)} bytes")
-
-        if r.status_code != 200:
-            return []
-
+    content = None
+    for attempt in range(3):
         try:
-            z = zipfile.ZipFile(io.BytesIO(r.content))
-        except zipfile.BadZipFile as e:
-            print(f"[VISION] ❌ ZIP corrupt: {e}")
+            r = requests.get(url, timeout=VISION_TIMEOUT)
+            if r.status_code == 404:
+                if verbose:
+                    print(f"[VISION] {symbol} {year}-{month:02d}: 404")
+                return []
+            if r.status_code != 200:
+                if verbose:
+                    print(f"[VISION] {symbol} {year}-{month:02d}: HTTP {r.status_code}")
+                return []
+            content = r.content
+            break
+        except requests.exceptions.Timeout:
+            if verbose:
+                print(f"[VISION] {symbol} {year}-{month:02d}: timeout, retry {attempt+1}/3")
+            if attempt == 2:
+                return []
+            time.sleep(3)
+        except Exception as e:
+            if verbose:
+                print(f"[VISION] {symbol} {year}-{month:02d}: {str(e)[:100]}")
             return []
 
-        names = z.namelist()
-        if not names:
-            print(f"[VISION] ❌ ZIP فارغ")
-            return []
+    if content is None:
+        return []
 
-        rows = []
+    # فك ZIP
+    try:
+        z = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as e:
+        print(f"[VISION] ZIP corrupt: {e}")
+        return []
+
+    names = z.namelist()
+    if not names:
+        return []
+
+    # قراءة الأسطر
+    rows = []
+    try:
         with z.open(names[0]) as f:
             for line in f:
                 line = line.strip()
@@ -190,7 +278,7 @@ def fetch_vision_month(symbol, year, month, verbose=True):
                     continue
                 try:
                     ts_sec = _normalize_ts(int(parts[0]))
-                    rows.append({
+                    row = {
                         "symbol": symbol,
                         "open_time": ts_sec * 1000,
                         "open": float(parts[1]),
@@ -201,125 +289,146 @@ def fetch_vision_month(symbol, year, month, verbose=True):
                         "quote_volume": float(parts[7]),
                         "taker_buy_base": float(parts[9]) if len(parts) > 9 else 0.0,
                         "interval": "15m",
-                    })
-                except Exception:
+                    }
+                    rows.append(row)
+                except (ValueError, IndexError):
                     continue
-
-        if verbose:
-            print(f"[VISION] parsed {len(rows)} شمعة من {year}-{month:02d}")
-
-        return rows
-
     except Exception as e:
-        print(f"[VISION] ❌ {symbol} {year}-{month:02d}: {e}")
+        print(f"[VISION] parse error: {e}")
         return []
 
+    if verbose:
+        print(f"[VISION] {symbol} {year}-{month:02d}: {len(rows)} شمعة")
+
+    return rows
+
 
 # ============================================================
-# حفظ في Supabase — مع logging مفصّل
+# تنظيف الصفوف
 # ============================================================
-def save_candles(rows, batch_size=200, verbose=True):
+def _clean_rows(rows):
     """
-    يحفظ الشموع في Supabase بطريقة آمنة:
-    - batch صغير (200 بدل 500)
-    - retry عند الفشل (3 محاولات)
-    - تنظيف القيم (NaN, inf)
-    - timeout طويل
-    - logging مفصّل
+    ينظّف الصفوف من:
+    - NaN / Inf
+    - open_time غير صالح
+    - symbol فارغ
     """
+    cleaned = []
+    skipped = 0
+
+    for r in rows:
+        try:
+            sym = str(r.get("symbol", "")).strip()
+            if not sym:
+                skipped += 1
+                continue
+
+            ot = int(r.get("open_time", 0))
+            if ot <= 0 or ot > 9_999_999_999_999:
+                skipped += 1
+                continue
+
+            # تحقق من كل قيم float
+            numeric_keys = ["open", "high", "low", "close",
+                            "volume", "quote_volume", "taker_buy_base"]
+            clean_row = {"symbol": sym, "open_time": ot, "interval": "15m"}
+            valid = True
+            for k in numeric_keys:
+                v = r.get(k, 0.0)
+                if not _is_finite_number(v):
+                    skipped += 1
+                    valid = False
+                    break
+                clean_row[k] = float(v)
+
+            if valid:
+                cleaned.append(clean_row)
+        except Exception:
+            skipped += 1
+            continue
+
+    return cleaned, skipped
+
+
+# ============================================================
+# حفظ في Supabase
+# ============================================================
+def save_candles(rows, batch_size=SAVE_BATCH_SIZE, verbose=True):
+    """
+    حفظ آمن في Supabase:
+    - تنظيف القيم
+    - batch_size صغير
+    - retry تلقائي
+    - تقسيم إلى أنصاف عند الفشل
+    - إعادة إنشاء client دورياً
+    """
+    global _sb_batches_since_reset
+
     if not rows:
         return 0
 
-    # 1. تنظيف القيم
-    cleaned = []
-    for r in rows:
-        try:
-            # تحقق من صحة القيم
-            vals = [r.get("open"), r.get("high"), r.get("low"),
-                    r.get("close"), r.get("volume"),
-                    r.get("quote_volume"), r.get("taker_buy_base")]
-            ok = True
-            for v in vals:
-                if v is None:
-                    continue
-                if isinstance(v, float):
-                    import math
-                    if math.isnan(v) or math.isinf(v):
-                        ok = False
-                        break
-            if not ok:
-                continue
-
-            # تحقق من open_time
-            ot = int(r.get("open_time", 0))
-            if ot <= 0 or ot > 9_999_999_999_999:
-                continue
-
-            cleaned.append({
-                "symbol": str(r["symbol"]),
-                "open_time": ot,
-                "open": float(r.get("open", 0)),
-                "high": float(r.get("high", 0)),
-                "low": float(r.get("low", 0)),
-                "close": float(r.get("close", 0)),
-                "volume": float(r.get("volume", 0)),
-                "quote_volume": float(r.get("quote_volume", 0)),
-                "taker_buy_base": float(r.get("taker_buy_base", 0)),
-                "interval": "15m",
-            })
-        except Exception:
-            continue
-
-    if verbose:
-        print(f"[SAVE] {len(rows)} صف → {len(cleaned)} صف بعد التنظيف")
-
+    # 1. تنظيف
+    cleaned, skipped = _clean_rows(rows)
+    if verbose and skipped:
+        print(f"[SAVE] cleaned: {len(rows)} → {len(cleaned)} (تخطي {skipped})")
     if not cleaned:
         return 0
 
-    # 2. الحفظ على دفعات صغيرة مع retry
-    sb = _sb_client()
-    total = 0
-    failed = 0
+    # 2. الحفظ على دفعات
+    total_saved = 0
+    total_failed = 0
 
     for i in range(0, len(cleaned), batch_size):
         batch = cleaned[i:i + batch_size]
-        success = False
+        saved = _save_batch(batch, verbose)
 
-        for attempt in range(3):
-            try:
-                sb.table("candles").upsert(batch).execute()
-                total += len(batch)
-                success = True
-                if verbose and (i // batch_size) % 10 == 0:
-                    print(f"[SAVE] ✅ {i+len(batch)}/{len(cleaned)}")
-                break
-            except Exception as e:
-                err_str = str(e)[:150]
-                if attempt < 2:
-                    if verbose:
-                        print(f"[SAVE] ⚠️ محاولة {attempt+1} فشلت: {err_str}")
-                    time.sleep(1.5 * (attempt + 1))  # exponential backoff
-                else:
-                    if verbose:
-                        print(f"[SAVE] ❌ فشل نهائي: {err_str}")
-                    failed += len(batch)
+        if saved:
+            total_saved += saved
+        else:
+            # محاولة تقسيم
+            if len(batch) > 20:
+                half = len(batch) // 2
+                for sub in [batch[:half], batch[half:]]:
+                    saved_sub = _save_batch(sub, verbose=False)
+                    total_saved += saved_sub
+            else:
+                total_failed += len(batch)
 
-        if not success and len(batch) > 50:
-            # محاولة أخيرة: اقسم إلى نصفين
-            if verbose:
-                print(f"[SAVE] 🔄 تقسيم الدفعة إلى نصفين...")
-            half = len(batch) // 2
-            for sub_batch in [batch[:half], batch[half:]]:
-                try:
-                    sb.table("candles").upsert(sub_batch).execute()
-                    total += len(sub_batch)
-                    failed -= len(sub_batch)
-                except Exception:
-                    pass
+        # إعادة إنشاء client دورياً
+        _sb_batches_since_reset += 1
+        if _sb_batches_since_reset >= CLIENT_RESET_EVERY:
+            _reset_sb_client()
 
     if verbose:
-        print(f"[SAVE] انتهى: نجح={total}, فشل={failed}")
-    return total
+        print(f"[SAVE] ✅ {total_saved} / {len(cleaned)} (فشل: {total_failed})")
+
+    return total_saved
+
+
+def _save_batch(batch, verbose=True):
+    """يحفظ دفعة واحدة مع retry"""
+    sb = _sb_client()
+
+    for attempt in range(SAVE_RETRIES):
+        try:
+            sb.table("candles").upsert(batch).execute()
+            if verbose and attempt > 0:
+                print(f"[SAVE] ✅ retry {attempt+1} نجح")
+            return len(batch)
+        except Exception as e:
+            err = str(e)[:200]
+            if attempt < SAVE_RETRIES - 1:
+                if verbose:
+                    print(f"[SAVE] ⚠️ محاولة {attempt+1} فشلت: {err[:100]}")
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                if verbose:
+                    print(f"[SAVE] ❌ فشل نهائي ({len(batch)} صف): {err[:150]}")
+                # محاولة إعادة إنشاء client
+                _reset_sb_client()
+                return 0
+
+    return 0
 
 
 # ============================================================
@@ -335,14 +444,15 @@ def fetch_and_store(symbol, days=None, progress_cb=None):
         if progress_cb:
             progress_cb(msg)
 
-    # فحص cache أولاً
+    # 1. هل موجود في cache؟
     try:
         if cache_has_data(symbol, days):
             _log(f"  ✅ {symbol}: موجود في cache")
             return 0
     except Exception as e:
-        _log(f"  ⚠️ {symbol}: فحص cache فشل ({str(e)[:80]})")
+        _log(f"  ⚠️ {symbol}: cache check: {str(e)[:80]}")
 
+    # 2. جلب الأشهر
     _log(f"  ⬇️  {symbol}: جلب من Binance Vision...")
 
     now = datetime.now(timezone.utc)
@@ -352,21 +462,26 @@ def fetch_and_store(symbol, days=None, progress_cb=None):
         months.append((d.year, d.month))
     months = list(dict.fromkeys(months))
 
-    total = 0
+    total_saved = 0
+
     for (year, month) in months:
         try:
             rows = fetch_vision_month(symbol, year, month, verbose=False)
-            if rows:
-                saved = save_candles(rows, verbose=False)
-                total += saved
-                _log(f"  📥 {symbol} {year}-{month:02d}: {saved} شمعة")
-            else:
+            if not rows:
                 _log(f"  ⚪ {symbol} {year}-{month:02d}: لا بيانات")
-        except Exception as e:
-            _log(f"  ⚠️ {symbol} {year}-{month:02d}: {str(e)[:80]}")
-        time.sleep(0.3)
+                continue
 
-    return total
+            # حفظ على دفعات صغيرة
+            saved = save_candles(rows, verbose=False)
+            total_saved += saved
+
+            _log(f"  📥 {symbol} {year}-{month:02d}: {saved}/{len(rows)} شمعة")
+        except Exception as e:
+            _log(f"  ❌ {symbol} {year}-{month:02d}: {str(e)[:100]}")
+
+        time.sleep(0.5)  # Rate limit protection
+
+    return total_saved
 
 
 def prepare_all_data(progress_cb=None):
@@ -376,17 +491,19 @@ def prepare_all_data(progress_cb=None):
         if progress_cb:
             progress_cb(msg)
 
-    # تشخيص أولاً
+    # تشخيص
     _log("🔍 تشخيص اتصال Supabase...")
     diag = diagnose_table()
     if not diag["ok"]:
         _log(f"❌ فشل التشخيص: {diag['issues']}")
         return 0
-    _log("✅ الاتصال بـ Supabase سليم")
+    _log("✅ Supabase سليم")
 
     total = 0
     for sym in CFG["SYMBOLS"]:
+        _log(f"\n🎯 {sym}")
         total += fetch_and_store(sym, CFG["DAYS"], progress_cb)
+
     return total
 
 
@@ -409,10 +526,13 @@ def update_backtest_run(run_id, **fields):
 
 
 def save_backtest_trades(run_id, trades):
+    """يحفظ الصفقات على دفعات صغيرة"""
     if not trades:
         return
+
     sb = _sb_client()
-    batch_size = 500
+    batch_size = 200
+
     for i in range(0, len(trades), batch_size):
         batch = []
         for t in trades[i:i + batch_size]:
@@ -438,4 +558,5 @@ def save_backtest_trades(run_id, trades):
         try:
             sb.table("backtest_trades").insert(batch).execute()
         except Exception as e:
-            print(f"[trades] batch {i}: {e}")
+            print(f"[trades] batch {i}: {str(e)[:150]}")
+            time.sleep(1)
