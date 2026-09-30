@@ -136,7 +136,7 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
                        direction: str = "LONG",
                        full_details: bool = False) -> str | None:
     """
-    رسالة مختصرة:
+    رسالة مختصرة تحتوي:
     - الإجراء
     - ثقة الإشارة
     - توافق المصفوفة (الدرجة المركبة)
@@ -338,29 +338,26 @@ async def cmd_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     now = datetime.now(timezone.utc)
 
-    # 1) اتفاق بسيط (البيانات الخام)
     m = agreement_score(sym, "LONG", now)
 
     if not m["available"]:
         debug = debug_matrix(sym, now)
+        safe = debug.replace("<", "&lt;").replace(">", "&gt;")
         text = (
             f"📊 <b>{sym}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"❌ {m.get('reason', 'غير معروف')}\n\n"
             f"<b>تشخيص:</b>\n"
-            f"<code>{debug}</code>"
+            f"<code>{safe}</code>"
         )
         await update.message.reply_text(text, parse_mode="HTML")
         return
 
-    # 2) الدرجة المركبة للاتجاهين
     comp_long = matrix_composite_score(sym, "LONG", now)
     comp_short = matrix_composite_score(sym, "SHORT", now)
-
-    # 3) سياق اليوم
     day_ctx = day_context(sym, dt=now)
 
-    # 4) توقع متعدد الآفاق (LONG للعرض)
+    # توقع متعدد الآفاق
     fc = final_confidence(0, sym, "LONG", dt=now)
     forecast = fc.get("forecast") if fc.get("available") else None
 
@@ -426,14 +423,9 @@ async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conf = _confidence(snap)
     direction = "LONG" if _is_buy_state(state) else "SHORT"
 
-    # نتيجة كاملة
     result = final_confidence(conf, sym, direction)
-
-    # رسالة غنية من matrix
     msg = format_matrix_message(sym, result)
 
-    # Telegram: عرض داخل <pre>
-    # نشذّب بعض الرموز غير المدعومة داخل <pre>
     safe = msg.replace("<", "&lt;").replace(">", "&gt;")
     await update.message.reply_text(f"<pre>{safe}</pre>", parse_mode="HTML")
 
@@ -507,7 +499,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             last = _state_cache.get(symbol)
 
             if last and last[0] != state:
-                # إشعار عند التغير إلى إشارة
                 if state in ("STRONG BUY SETUP", "BUY SETUP",
                              "STRONG SELL SETUP", "SELL SETUP",
                              "EARLY BUY", "EARLY SELL"):
@@ -531,7 +522,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# Health Server
+# Health Server (لـ UptimeRobot)
 # ============================================================
 class _H(BaseHTTPRequestHandler):
     def do_GET(self):
