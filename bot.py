@@ -65,7 +65,7 @@ CROSSOVER_JOB_INTERVAL_MIN = 5
 # ═══ إضافة جديدة: استبعاد الإشارات المبكرة ═══
 # ════════════════════════════════════════════════════════════
 # إذا كانت True: لن يتم إرسال إشعارات "فرصة شراء/بيع مبكرة"
-EXCLUDE_EARLY_SIGNALS = True
+EXCLUDE_EARLY_SIGNALS = False
 
 # الحالات المستبعدة (يمكنك إضافة/إزالة حسب الحاجة)
 EXCLUDED_STATES = {"EARLY BUY", "EARLY SELL"}
