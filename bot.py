@@ -2,15 +2,18 @@
 Smart Analyst — رأي المحلل + المصفوفة الإحصائية.
 نسخة مخففة: نافذة أوسع + منع تكرار أقل صرامة + تشخيص مدمج
 + ميزة تقاطع EMA (مستقلة تماماً)
++ وقت وتاريخ سوريا في كل الإشعارات
++ استبعاد إشعارات "فرصة شراء/بيع مبكرة"
 """
 import os
 import threading
 import logging
-import ccxt                     # ═══ إضافة جديدة ═══
-import pandas as pd             # ═══ إضافة جديدة ═══
-import asyncio                  # ═══ إضافة جديدة ═══
+import ccxt
+import pandas as pd
+import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -29,7 +32,7 @@ from matrix import (
 load_dotenv()
 
 # ============================================================
-# الإعدادات — معدّلة
+# الإعدادات
 # ============================================================
 BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_REPORT_CHAT_ID")
@@ -44,19 +47,36 @@ SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
 # ✅ الفواصل الزمنية (مخففة)
 HOURLY_MIN = 60
 ALERT_MIN = 5
-ACTIVE_WINDOW_MIN = 180         # 3 ساعات
-NOW_WINDOW_MIN = 180            # 3 ساعات
-SYM_WINDOW_MIN = 360            # 6 ساعات
-SIGNAL_COOLDOWN_MIN = 15        # 15 دقيقة
-SCORE_CHANGE_THRESHOLD = 5      # تغير الدرجة
+ACTIVE_WINDOW_MIN = 180
+NOW_WINDOW_MIN = 180
+SYM_WINDOW_MIN = 360
+SIGNAL_COOLDOWN_MIN = 15
+SCORE_CHANGE_THRESHOLD = 5
 
 # ════════════════════════════════════════════════════════════
-# ═══ إضافة جديدة: إعدادات ميزة تقاطع EMA ═══
+# إعدادات ميزة تقاطع EMA
 # ════════════════════════════════════════════════════════════
 CROSSOVER_TIMEFRAME = "15m"
 CROSSOVER_EMA_FAST = 7
 CROSSOVER_EMA_SLOW = 25
 CROSSOVER_JOB_INTERVAL_MIN = 5
+
+# ════════════════════════════════════════════════════════════
+# ═══ إضافة جديدة: استبعاد الإشارات المبكرة ═══
+# ════════════════════════════════════════════════════════════
+# إذا كانت True: لن يتم إرسال إشعارات "فرصة شراء/بيع مبكرة"
+EXCLUDE_EARLY_SIGNALS = True
+
+# الحالات المستبعدة (يمكنك إضافة/إزالة حسب الحاجة)
+EXCLUDED_STATES = {"EARLY BUY", "EARLY SELL"}
+
+# ════════════════════════════════════════════════════════════
+# ═══ إضافة جديدة: توقيت سوريا ═══
+# ════════════════════════════════════════════════════════════
+try:
+    SYRIA_TZ = ZoneInfo("Asia/Damascus")
+except Exception:
+    SYRIA_TZ = timezone(timedelta(hours=3))
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -81,6 +101,27 @@ async def error_handler(update, context):
 # ============================================================
 def _short(symbol: str) -> str:
     return symbol.split("/")[0].upper()
+
+
+def _syria_now_str() -> str:
+    """يعيد الوقت والتاريخ الحاليين بتوقيت سوريا بصيغة عربية."""
+    now = datetime.now(SYRIA_TZ)
+    days_ar = {
+        "Monday": "الاثنين", "Tuesday": "الثلاثاء", "Wednesday": "الأربعاء",
+        "Thursday": "الخميس", "Friday": "الجمعة", "Saturday": "السبت",
+        "Sunday": "الأحد",
+    }
+    day_ar = days_ar.get(now.strftime("%A"), now.strftime("%A"))
+    return f"{day_ar} {now.strftime('%Y-%m-%d')} — {now.strftime('%H:%M:%S')}"
+
+
+def _syria_from_ts(ts_ms: int) -> str:
+    """يحوّل timestamp بالميلي ثانية إلى وقت سوريا بصيغة مقروءة."""
+    try:
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=SYRIA_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "?"
 
 
 def _confidence(snap: dict) -> int:
@@ -126,6 +167,16 @@ def _is_buy_state(state: str) -> bool:
     return "BUY" in state
 
 
+# ════════════════════════════════════════════════════════════
+# ═══ إضافة جديدة: فحص الحالات المستبعدة ═══
+# ════════════════════════════════════════════════════════════
+def _is_excluded_state(state: str) -> bool:
+    """تفحص إذا كانت الحالة مستبعدة من الإشعارات التلقائية."""
+    if not EXCLUDE_EARLY_SIGNALS:
+        return False
+    return state in EXCLUDED_STATES
+
+
 # ============================================================
 # جلب snapshots
 # ============================================================
@@ -144,7 +195,6 @@ def get_latest_snapshot(symbol: str) -> dict | None:
 
 
 def get_active_signal(symbol: str, minutes: int = ACTIVE_WINDOW_MIN) -> dict | None:
-    """يبحث عن أقوى إشارة نشطة في آخر N دقيقة"""
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
     try:
         res = (
@@ -190,14 +240,10 @@ def get_all_active_signals(symbol: str, minutes: int = ACTIVE_WINDOW_MIN) -> lis
 
 
 # ============================================================
-# منع التكرار (مخفف)
+# منع التكرار
 # ============================================================
 _signal_cache: dict = {}
-
-# ════════════════════════════════════════════════════════════
-# ═══ إضافة جديدة: ذاكرة تقاطعات EMA + تهيئة المنصة ═══
-# ════════════════════════════════════════════════════════════
-_crossover_cache: dict = {}   # {symbol: {"direction": ..., "candle_ts": ...}}
+_crossover_cache: dict = {}
 
 try:
     _exchange = ccxt.binance({"enableRateLimit": True})
@@ -208,11 +254,6 @@ except Exception as _e:
 
 def should_send_signal(symbol: str, snap: dict,
                        cooldown_min: int = SIGNAL_COOLDOWN_MIN) -> bool:
-    """
-    يمنع التكرار فقط إذا:
-    - نفس الحالة تماماً
-    - خلال أقل من cooldown_min
-    """
     state = snap.get("state", "")
     now = datetime.now(timezone.utc)
 
@@ -232,7 +273,7 @@ def should_send_signal(symbol: str, snap: dict,
 
 
 # ============================================================
-# بناء الرسالة
+# بناء الرسالة العادية
 # ============================================================
 def build_short_signal(symbol: str, state: str, signal_conf: int,
                        direction: str = "LONG",
@@ -243,6 +284,8 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
 
     result = final_confidence(signal_conf, symbol, direction)
     lines = [action]
+    # ═══ إضافة: وقت سوريا في كل إشعار ═══
+    lines.append(f"🇸🇾 <b>{_syria_now_str()}</b>")
     lines.append(f"🎯 ثقة الإشارة: <b>{signal_conf}%</b>")
 
     if result.get("available"):
@@ -288,14 +331,10 @@ def build_short_signal(symbol: str, state: str, signal_conf: int,
     return "\n".join(lines)
 
 
-# ════════════════════════════════════════════════════════════
-# ═══ إضافة جديدة: ميزة تقاطع EMA — دوال مستقلة ═══
-# ════════════════════════════════════════════════════════════
+# ============================================================
+# ميزة تقاطع EMA
+# ============================================================
 async def detect_crossover(symbol: str, timeframe: str = CROSSOVER_TIMEFRAME) -> dict | None:
-    """
-    تكتشف تقاطع EMA السريع مع EMA البطيء في آخر شمعة مغلقة.
-    ترجع dict عند وجود تقاطع جديد، أو None.
-    """
     if _exchange is None:
         return None
     try:
@@ -311,7 +350,6 @@ async def detect_crossover(symbol: str, timeframe: str = CROSSOVER_TIMEFRAME) ->
         df["ema_fast"] = df["close"].ewm(span=CROSSOVER_EMA_FAST, adjust=False).mean()
         df["ema_slow"] = df["close"].ewm(span=CROSSOVER_EMA_SLOW, adjust=False).mean()
 
-        # نستخدم الشمعة المغلقة الأخيرة (-2) لتجنب إشارات وهمية
         curr = -2
         prev = -3
 
@@ -347,40 +385,34 @@ async def detect_crossover(symbol: str, timeframe: str = CROSSOVER_TIMEFRAME) ->
 
 
 def build_crossover_message(cross: dict) -> str:
-    """
-    تبني رسالة التقاطع، مدموجة مع بيانات Supabase والمصفوفة.
-    """
     symbol = cross["symbol"]
     short = _short(symbol)
     is_bull = (cross["direction"] == "bullish")
     dir_str = "LONG" if is_bull else "SHORT"
 
-    # وقت الشمعة
-    try:
-        candle_time = datetime.fromtimestamp(
-            cross["candle_ts"] / 1000, tz=timezone.utc
-        ).strftime("%H:%M UTC")
-    except Exception:
-        candle_time = "?"
+    candle_time_syria = _syria_from_ts(cross["candle_ts"])
 
-    # ====== العنوان ======
     if is_bull:
-        lines = [f"🚀 <b>إشارة تقاطع EMA — {short}</b>", "━━━━━━━━━━━━━━━━━━━"]
+        lines = [f"🚀 <b>إشارة تقاطع EMA — {short}</b>"]
+    else:
+        lines = [f"🔻 <b>إشارة تقاطع EMA — {short}</b>"]
+
+    lines.append(f"🇸🇾 <b>{_syria_now_str()}</b>")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+
+    if is_bull:
         lines.append("📈 <b>التقاطع: صاعد 🟢</b>")
     else:
-        lines = [f"🔻 <b>إشارة تقاطع EMA — {short}</b>", "━━━━━━━━━━━━━━━━━━━"]
         lines.append("📉 <b>التقاطع: هابط 🔴</b>")
 
-    # ====== تفاصيل التقاطع ======
     lines.append(
         f"• EMA{CROSSOVER_EMA_FAST}: {cross['ema_fast']} | "
         f"EMA{CROSSOVER_EMA_SLOW}: {cross['ema_slow']}"
     )
     lines.append(f"• السعر عند الإغلاق: {cross['price']}")
     lines.append(f"• الفريم: {cross['timeframe']}")
-    lines.append(f"• وقت الشمعة: {candle_time}")
+    lines.append(f"• وقت الشمعة (سوريا): {candle_time_syria}")
 
-    # ====== القسم 1: قاعدة البيانات ======
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━")
     lines.append("🗄️ <b>من قاعدة البيانات:</b>")
@@ -397,7 +429,6 @@ def build_crossover_message(cross: dict) -> str:
     else:
         lines.append("• <i>لا يوجد snapshot حديث</i>")
 
-    # ====== القسم 2: المصفوفة ======
     lines.append("")
     lines.append("📊 <b>من المصفوفة:</b>")
 
@@ -437,7 +468,6 @@ def build_crossover_message(cross: dict) -> str:
     else:
         lines.append(f"• <i>{result.get('reason', 'لا بيانات')}</i>")
 
-    # ====== الخلاصة ======
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━")
     lines.append("⚖️ <b>الخلاصة:</b>")
@@ -462,7 +492,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━\n\n"
         f"🔧 <b>الإعدادات الحالية:</b>\n"
         f"• نافذة الإشارات: {ACTIVE_WINDOW_MIN} دقيقة\n"
-        f"• منع التكرار: {SIGNAL_COOLDOWN_MIN} دقيقة\n\n"
+        f"• منع التكرار: {SIGNAL_COOLDOWN_MIN} دقيقة\n"
+        f"• استبعاد المبكرة: {'نعم' if EXCLUDE_EARLY_SIGNALS else 'لا'}\n\n"
         f"📌 <b>Chat ID:</b> <code>{cid}</code>\n\n"
         "<b>الأوامر:</b>\n"
         "/now — فحص فوري\n"
@@ -471,7 +502,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/full BTC — تقرير غني\n"
         "/test — 🔍 تشخيص مفصل\n"
         "/raw — تشخيص المصفوفة\n"
-        "/cross — 🔀 فحص تقاطعات EMA"     # ═══ إضافة جديدة ═══
+        "/cross — 🔀 فحص تقاطعات EMA"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -485,6 +516,11 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         state = snap.get("state", "NO TRADE")
+
+        # ═══ استبعاد الإشارات المبكرة ═══
+        if _is_excluded_state(state):
+            continue
+
         conf = _confidence(snap)
         direction = "LONG" if _is_buy_state(state) else "SHORT"
         msg = build_short_signal(symbol, state, conf, direction, full_details=True)
@@ -495,14 +531,13 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sent == 0:
         await update.message.reply_text(
-            f"⚪ لا إشارات نشطة خلال آخر {NOW_WINDOW_MIN} دقيقة.\n"
+            f"⚪ لا إشارات خلال آخر {NOW_WINDOW_MIN} دقيقة.\n"
             f"<i>جرّب /test للتشخيص</i>",
             parse_mode="HTML",
         )
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تشخيص شامل"""
     now = datetime.now(timezone.utc)
     lines = [f"🔍 <b>تشخيص</b> — {now.strftime('%H:%M')} UTC\n"]
 
@@ -510,9 +545,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_actives = 0
 
     for symbol in SYMBOLS:
-        # آخر snapshot
         latest = get_latest_snapshot(symbol)
-        # الإشارات النشطة في النافذة
         actives = get_all_active_signals(symbol, ACTIVE_WINDOW_MIN)
 
         total_snapshots += 1 if latest else 0
@@ -647,15 +680,11 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"<code>{safe}</code>", parse_mode="HTML")
 
 
-# ════════════════════════════════════════════════════════════
-# ═══ إضافة جديدة: أمر /cross للفحص اليدوي ═══
-# ════════════════════════════════════════════════════════════
 async def cmd_cross(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """فحص تقاطعات EMA يدوياً (يتجاهل الذاكرة)"""
     await update.message.reply_text("🔍 جاري فحص التقاطعات...")
     found = 0
     for symbol in SYMBOLS:
-        _crossover_cache.pop(symbol, None)  # تجاهل الذاكرة
+        _crossover_cache.pop(symbol, None)
         cross = await detect_crossover(symbol, CROSSOVER_TIMEFRAME)
         if cross:
             msg = build_crossover_message(cross)
@@ -675,6 +704,7 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
     print(f"\n⏰ [HOURLY] {datetime.now(timezone.utc).strftime('%H:%M')}")
     sent = 0
     skipped = 0
+    excluded = 0
 
     for symbol in SYMBOLS:
         try:
@@ -682,11 +712,18 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
             if not snap:
                 continue
 
+            state = snap.get("state", "NO TRADE")
+
+            # ═══ استبعاد الإشارات المبكرة ═══
+            if _is_excluded_state(state):
+                print(f"🚫 [{symbol}] مستبعد: {state}")
+                excluded += 1
+                continue
+
             if not should_send_signal(symbol, snap):
                 skipped += 1
                 continue
 
-            state = snap.get("state", "NO TRADE")
             conf = _confidence(snap)
             direction = "LONG" if _is_buy_state(state) else "SHORT"
             msg = build_short_signal(symbol, state, conf, direction)
@@ -700,14 +737,13 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"❌ [{symbol}] {e}")
 
-    print(f"📊 أُرسل={sent}, تخطي={skipped}")
+    print(f"📊 أُرسل={sent}, تخطي={skipped}, مستبعد={excluded}")
 
 
 _state_cache: dict = {}
 
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    """كل 5 دقائق — يفعل على تغير الحالة أو الدرجة"""
     try:
         for symbol in SYMBOLS:
             snap = get_active_signal(symbol, minutes=ACTIVE_WINDOW_MIN)
@@ -718,6 +754,11 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             state = snap.get("state")
             score = abs(snap.get("total_score", 0))
             last = _state_cache.get(symbol)
+
+            # ═══ استبعاد الإشارات المبكرة ═══
+            if _is_excluded_state(state):
+                _state_cache[symbol] = (state, score)
+                continue
 
             is_new = (last is None)
             changed = (last is not None and (
@@ -752,14 +793,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         print(f"[alert_job] {e}")
 
 
-# ════════════════════════════════════════════════════════════
-# ═══ إضافة جديدة: Job مستقل لفحص تقاطعات EMA ═══
-# ════════════════════════════════════════════════════════════
 async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Job مستقل يفحص تقاطعات EMA كل 5 دقائق على جميع العملات.
-    لا يتدخل في alert_job أو hourly_job.
-    """
     try:
         found = 0
         for symbol in SYMBOLS:
@@ -814,6 +848,7 @@ def main():
     threading.Thread(target=_run_health, daemon=True).start()
     print("🧠 Analyst Bot + Matrix يبدأ...")
     print(f"🔎 نافذة: {ACTIVE_WINDOW_MIN}د | cooldown: {SIGNAL_COOLDOWN_MIN}د")
+    print(f"🚫 استبعاد المبكرة: {EXCLUDE_EARLY_SIGNALS} | الحالات: {EXCLUDED_STATES}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -823,14 +858,13 @@ def main():
     app.add_handler(CommandHandler("matrix", cmd_matrix))
     app.add_handler(CommandHandler("full", cmd_full))
     app.add_handler(CommandHandler("raw", cmd_raw))
-    app.add_handler(CommandHandler("test", cmd_test))   # ← جديد
-    app.add_handler(CommandHandler("cross", cmd_cross)) # ═══ إضافة جديدة ═══
+    app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("cross", cmd_cross))
     app.add_error_handler(error_handler)
 
     if app.job_queue:
         app.job_queue.run_repeating(hourly_job, interval=HOURLY_MIN * 60, first=10, name="hourly")
         app.job_queue.run_repeating(alert_job, interval=ALERT_MIN * 60, first=30, name="alerts")
-        # ═══ إضافة جديدة: Job مستقل لتقاطعات EMA ═══
         app.job_queue.run_repeating(
             crossover_job,
             interval=CROSSOVER_JOB_INTERVAL_MIN * 60,
@@ -838,7 +872,7 @@ def main():
             name="crossover",
         )
         print(f"⏰ hourly كل {HOURLY_MIN}د | alerts كل {ALERT_MIN}د")
-        print(f"🔀 crossover كل {CROSSOVER_JOB_INTERVAL_MIN}د | فريم {CROSSOVER_TIMEFRAME}") # ═══ إضافة جديدة ═══
+        print(f"🔀 crossover كل {CROSSOVER_JOB_INTERVAL_MIN}د | فريم {CROSSOVER_TIMEFRAME}")
 
     print("✅ جاهز")
     app.run_polling(
