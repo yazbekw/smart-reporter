@@ -1,11 +1,13 @@
 """
-بوت إشعارات تقاطع EMA — مصادر متعددة (OKX / Bybit / KuCoin / Kraken)
-بدون الحاجة إلى API Key — بيانات عامة فقط
+بوت إشعارات تقاطع EMA — مصادر متعددة
+يدعم فريمين متوازيين (15m + 1h) + فلتر قوة
 """
 import os
+import re
 import asyncio
 import logging
 import threading
+import time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -20,36 +22,58 @@ from telegram.error import NetworkError, TimedOut
 load_dotenv()
 
 # ============================================================
-# الإعدادات الأساسية
+# إعدادات
 # ============================================================
 BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_REPORT_CHAT_ID")
 
-# المصدر: okx / bybit / kucoin / kraken / binance
-EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "okx").lower()
 
-# الرموز (صيغة ccxt الموحدة: BASE/QUOTE)
+def _get_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    m = re.search(r"-?\d+(\.\d+)?", str(raw))
+    return float(m.group(0)) if m else default
+
+
+def _get_int(name: str, default: int) -> int:
+    return int(_get_float(name, default))
+
+
+def _get_bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("true", "1", "yes", "on")
+
+
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "okx").strip().lower()
+
+_default_symbols = (
+    "BTC/USDT,ETH/USDT,BNB/USDT,SOL/USDT,"
+    "XRP/USDT,ADA/USDT,AVAX/USDT,DOGE/USDT"
+)
+_raw = os.getenv("SYMBOLS", "").strip()
 SYMBOLS = [
     s.strip().upper()
-    for s in os.getenv(
-        "SYMBOLS",
-        "BTC/USDT,ETH/USDT,BNB/USDT,SOL/USDT,XRP/USDT,ADA/USDT,AVAX/USDT,DOGE/USDT"
-    ).split(",")
+    for s in (_raw or _default_symbols).split(",")
     if s.strip()
 ]
 
-# إعدادات التقاطع
-TIMEFRAME       = os.getenv("TIMEFRAME", "15m")
-EMA_FAST        = int(os.getenv("EMA_FAST", "7"))
-EMA_SLOW        = int(os.getenv("EMA_SLOW", "25"))
-JOB_INTERVAL_MIN = int(os.getenv("JOB_INTERVAL_MIN", "5"))
+# الفريمات المدعومة
+TIMEFRAMES = [
+    t.strip()
+    for t in os.getenv("TIMEFRAMES", "15m,1h").split(",")
+    if t.strip()
+]
 
-# فلتر الاتجاه العام (اختياري)
-TREND_FILTER_ENABLED = os.getenv("TREND_FILTER_ENABLED", "false").lower() == "true"
-TREND_TIMEFRAME      = os.getenv("TREND_TIMEFRAME", "1h")
-TREND_EMA_PERIOD     = int(os.getenv("TREND_EMA_PERIOD", "200"))
+EMA_FAST = _get_int("EMA_FAST", 7)
+EMA_SLOW = _get_int("EMA_SLOW", 25)
 
-# توقيت سوريا
+JOB_INTERVAL_MIN = _get_int("JOB_INTERVAL_MIN", 5)
+
+# فلتر قوة التقاطع
+MIN_EMA_GAP = _get_float("MIN_EMA_GAP", 0.10)   # % أدنى فرق بين EMA
+
+# مستويات تصنيف القوة (تُضاف فوق MIN_EMA_GAP)
+STRONG_GAP_15M = _get_float("STRONG_GAP_15M", 0.20)
+STRONG_GAP_1H  = _get_float("STRONG_GAP_1H", 0.20)
+
 SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
 # ============================================================
@@ -67,47 +91,36 @@ log = logging.getLogger("cross")
 
 
 # ============================================================
-# التهيئة — ccxt exchange
+# ccxt
 # ============================================================
 def init_exchange():
-    """
-    ينشئ نسخة ccxt من المنصة المحددة.
-    مع تفعيل rate limit + timeout للحماية.
-    """
     options = {
         "enableRateLimit": True,
         "timeout": 30000,
         "options": {"defaultType": "spot"},
     }
+    mapping = {
+        "okx": ccxt.okx,
+        "bybit": ccxt.bybit,
+        "kucoin": ccxt.kucoin,
+        "kraken": ccxt.kraken,
+        "binance": ccxt.binance,
+        "coinbase": ccxt.coinbase,
+    }
+    cls = mapping.get(EXCHANGE_NAME, ccxt.okx)
     try:
-        if EXCHANGE_NAME == "okx":
-            ex = ccxt.okx(options)
-        elif EXCHANGE_NAME == "bybit":
-            ex = ccxt.bybit(options)
-        elif EXCHANGE_NAME == "kucoin":
-            ex = ccxt.kucoin(options)
-        elif EXCHANGE_NAME == "kraken":
-            ex = ccxt.kraken(options)
-        elif EXCHANGE_NAME == "binance":
-            ex = ccxt.binance(options)
-        elif EXCHANGE_NAME == "coinbase":
-            ex = ccxt.coinbase(options)
-        else:
-            log.warning(f"منصة غير معروفة: {EXCHANGE_NAME} → OKX افتراضياً")
-            ex = ccxt.okx(options)
+        ex = cls(options)
         log.info(f"✅ تم تهيئة {ex.name}")
         return ex
     except Exception as e:
-        log.error(f"❌ فشل تهيئة {EXCHANGE_NAME}: {e}")
+        log.error(f"❌ فشل التهيئة: {e}")
         return None
 
 
 _exchange = init_exchange()
 
-# كاش للتقاطعات لتجنب التكرار
+# كاش: {(symbol, timeframe): {"direction":..., "candle_ts":...}}
 _crossover_cache: dict = {}
-# كاش لاتجاه EMA 200
-_trend_cache: dict = {}
 
 
 # ============================================================
@@ -124,14 +137,13 @@ def syria_now_str() -> str:
         "Thursday": "الخميس", "Friday": "الجمعة", "Saturday": "السبت",
         "Sunday": "الأحد",
     }
-    day_ar = days_ar.get(now.strftime("%A"), now.strftime("%A"))
-    return f"{day_ar} {now.strftime('%Y-%m-%d')} — {now.strftime('%H:%M:%S')}"
+    return f"{days_ar.get(now.strftime('%A'), now.strftime('%A'))} " \
+           f"{now.strftime('%Y-%m-%d')} — {now.strftime('%H:%M:%S')}"
 
 
 def syria_from_ts(ts_ms: int) -> str:
     try:
-        dt = datetime.fromtimestamp(ts_ms / 1000, tz=SYRIA_TZ)
-        return dt.strftime("%Y-%m-%d %H:%M")
+        return datetime.fromtimestamp(ts_ms / 1000, tz=SYRIA_TZ).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return "?"
 
@@ -141,10 +153,9 @@ def calc_ema(series: pd.Series, period: int) -> pd.Series:
 
 
 # ============================================================
-# جلب البيانات من المنصة
+# جلب الشموع
 # ============================================================
-async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150) -> list | None:
-    """يجلب الشموع من المنصة المختارة (async عبر to_thread)."""
+async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150):
     if _exchange is None:
         return None
     try:
@@ -152,13 +163,10 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150) -> list | N
             _exchange.fetch_ohlcv, symbol, timeframe, None, limit
         )
     except ccxt.BadSymbol:
-        log.warning(f"⚠️ رمز غير مدعوم على {EXCHANGE_NAME}: {symbol}")
+        log.warning(f"⚠️ رمز غير مدعوم: {symbol}")
         return None
-    except ccxt.NetworkError as e:
-        log.warning(f"🌐 شبكة {symbol}: {e}")
-        return None
-    except ccxt.ExchangeError as e:
-        log.warning(f"⚠️ منصة {symbol}: {e}")
+    except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+        log.warning(f"⚠️ {symbol} {timeframe}: {e}")
         return None
     except Exception as e:
         log.warning(f"❌ {symbol}: {e}")
@@ -166,56 +174,44 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150) -> list | N
 
 
 # ============================================================
-# فلتر الاتجاه العام
+# تصنيف قوة الإشارة
 # ============================================================
-async def get_trend(symbol: str) -> str | None:
+def classify_strength(timeframe: str, gap_pct: float) -> str:
     """
-    يحسب اتجاه EMA 200 على إطار أعلى.
-    يُعيد 'UP' / 'DOWN' / None.
+    يُعيد وسم القوة بناءً على الفريم والفرق.
     """
-    if not TREND_FILTER_ENABLED:
-        return None
-
-    # كاش 10 دقائق
-    import time as _t
-    cached = _trend_cache.get(symbol)
-    now = _t.time()
-    if cached and now - cached[0] < 600:
-        return cached[1]
-
-    ohlcv = await fetch_ohlcv(symbol, TREND_TIMEFRAME, TREND_EMA_PERIOD + 30)
-    if not ohlcv or len(ohlcv) < TREND_EMA_PERIOD + 5:
-        return None
-
-    df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
-    ema = calc_ema(df["c"], TREND_EMA_PERIOD)
-    last_price = float(df["c"].iloc[-1])
-    trend = "UP" if last_price > float(ema.iloc[-1]) else "DOWN"
-    _trend_cache[symbol] = (now, trend)
-    return trend
+    if timeframe == "1h":
+        if gap_pct >= STRONG_GAP_1H:
+            return "🔥 قوية جداً"
+        return "🟢 قوية"
+    else:  # 15m أو أي فريم قصير
+        if gap_pct >= STRONG_GAP_15M:
+            return "🟢 قوية"
+        return "🟡 متوسطة"
 
 
 # ============================================================
 # اكتشاف التقاطع
 # ============================================================
-async def detect_crossover(symbol: str) -> dict | None:
+async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
     """
-    يفحص تقاطع EMA على الشمعة المغلقة الأخيرة.
-    يُعيد dict أو None.
+    يكتشف التقاطع على فريم محدد.
+    مع فلتر فرق EMA الأدنى.
     """
-    ohlcv = await fetch_ohlcv(symbol, TIMEFRAME, EMA_SLOW + 50)
+    ohlcv = await fetch_ohlcv(symbol, timeframe, EMA_SLOW + 50)
     if not ohlcv or len(ohlcv) < EMA_SLOW + 5:
         return None
 
     df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
-    df["ema_fast"] = calc_ema(df["c"], EMA_FAST)
-    df["ema_slow"] = calc_ema(df["c"], EMA_SLOW)
+    df["ef"] = calc_ema(df["c"], EMA_FAST)
+    df["es"] = calc_ema(df["c"], EMA_SLOW)
 
-    # الشمعة المغلقة الأخيرة = -2 (الأخيرة قيد التكوين)
     curr, prev = -2, -3
 
-    cf, cs = float(df["ema_fast"].iloc[curr]), float(df["ema_slow"].iloc[curr])
-    pf, ps = float(df["ema_fast"].iloc[prev]), float(df["ema_slow"].iloc[prev])
+    cf = float(df["ef"].iloc[curr])
+    cs = float(df["es"].iloc[curr])
+    pf = float(df["ef"].iloc[prev])
+    ps = float(df["es"].iloc[prev])
 
     bullish = (cf > cs) and (pf <= ps)
     bearish = (cf < cs) and (pf >= ps)
@@ -224,22 +220,34 @@ async def detect_crossover(symbol: str) -> dict | None:
         return None
 
     direction = "bullish" if bullish else "bearish"
+
+    # فلتر فرق EMA
+    gap_pct = abs(cf - cs) / cs * 100
+    if gap_pct < MIN_EMA_GAP:
+        log.info(
+            f"⏭️ {symbol} {timeframe}: فرق ضعيف {gap_pct:.3f}% < {MIN_EMA_GAP}%"
+        )
+        return None
+
     candle_ts = int(df["ts"].iloc[curr])
 
-    # منع التكرار
-    last = _crossover_cache.get(symbol)
+    # منع التكرار حسب (الرمز، الفريم)
+    cache_key = (symbol, timeframe)
+    last = _crossover_cache.get(cache_key)
     if last and last.get("candle_ts") == candle_ts and last.get("direction") == direction:
         return None
-    _crossover_cache[symbol] = {"direction": direction, "candle_ts": candle_ts}
+    _crossover_cache[cache_key] = {"direction": direction, "candle_ts": candle_ts}
 
     return {
         "symbol": symbol,
+        "timeframe": timeframe,
         "direction": direction,
         "ema_fast": round(cf, 4),
         "ema_slow": round(cs, 4),
         "price": round(float(df["c"].iloc[curr]), 4),
         "candle_ts": candle_ts,
-        "timeframe": TIMEFRAME,
+        "gap_pct": round(gap_pct, 3),
+        "strength": classify_strength(timeframe, gap_pct),
         "exchange": EXCHANGE_NAME.upper(),
     }
 
@@ -247,96 +255,98 @@ async def detect_crossover(symbol: str) -> dict | None:
 # ============================================================
 # بناء الرسالة
 # ============================================================
-def build_message(cross: dict, trend: str | None = None) -> str:
+def build_message(cross: dict) -> str:
     symbol = cross["symbol"]
+    tf = cross["timeframe"]
     is_bull = (cross["direction"] == "bullish")
     emoji = "🚀" if is_bull else "🔻"
     title = "تقاطع صاعد 🟢" if is_bull else "تقاطع هابط 🔴"
     candle_time = syria_from_ts(cross["candle_ts"])
 
-    lines = [
-        f"{emoji} <b>إشارة تقاطع EMA — {short(symbol)}</b>",
-        f"🇸🇾 <b>{syria_now_str()}</b>",
-        "━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>{title}</b>",
-        f"• EMA{EMA_FAST}: {cross['ema_fast']}",
-        f"• EMA{EMA_SLOW}: {cross['ema_slow']}",
-        f"• السعر: {cross['price']}",
-        f"• الفريم: {cross['timeframe']}",
-        f"• وقت الشمعة: {candle_time}",
-        f"• المصدر: {cross['exchange']}",
-    ]
-
-    # فلتر الاتجاه إن مفعّل
-    if TREND_FILTER_ENABLED and trend:
-        trend_emoji = "📈" if trend == "UP" else "📉"
-        compatible = (
-            (is_bull and trend == "UP") or
-            (not is_bull and trend == "DOWN")
-        )
-        compat_txt = "✅ متوافق" if compatible else "⚠️ ضد الاتجاه"
-        lines.append(
-            f"• الاتجاه العام ({TREND_TIMEFRAME} EMA{TREND_EMA_PERIOD}): "
-            f"{trend_emoji} {trend} | {compat_txt}"
-        )
-
-    return "\n".join(lines)
+    return (
+        f"{emoji} <b>تقاطع EMA — {short(symbol)} [{tf}]</b>\n"
+        f"🇸🇾 <b>{syria_now_str()}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>{title}</b>\n"
+        f"⚡ القوة: <b>{cross['strength']}</b>\n"
+        f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"• EMA{EMA_FAST}: {cross['ema_fast']}\n"
+        f"• EMA{EMA_SLOW}: {cross['ema_slow']}\n"
+        f"• السعر: {cross['price']}\n"
+        f"• الفريم: <b>{tf}</b>\n"
+        f"• وقت الشمعة: {candle_time}\n"
+        f"• المصدر: {cross['exchange']}"
+    )
 
 
 # ============================================================
 # الأوامر
 # ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    source_status = _exchange.name if _exchange else "❌ فشل"
-    trend_status = (
-        f"🟢 مفعل ({TREND_TIMEFRAME} EMA{TREND_EMA_PERIOD})"
-        if TREND_FILTER_ENABLED else "🔴 معطل"
-    )
+    source = _exchange.name if _exchange else "❌ فشل"
     await update.message.reply_text(
-        f"🔀 <b>بوت تقاطع EMA</b>\n"
+        f"🔀 <b>بوت تقاطع EMA — فريمين متوازيين</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>الإعدادات:</b>\n"
-        f"• المصدر: <b>{source_status}</b>\n"
-        f"• الفريم: {TIMEFRAME}\n"
+        f"• المصدر: <b>{source}</b>\n"
+        f"• الفريمات: <b>{', '.join(TIMEFRAMES)}</b>\n"
         f"• EMA: {EMA_FAST}/{EMA_SLOW}\n"
         f"• الرموز: {len(SYMBOLS)}\n"
         f"• الفحص: كل {JOB_INTERVAL_MIN} دقائق\n"
-        f"• فلتر الاتجاه: {trend_status}\n\n"
+        f"• أدنى فرق EMA: <b>{MIN_EMA_GAP}%</b>\n"
+        f"• عتبة القوة (15m): {STRONG_GAP_15M}% | (1h): {STRONG_GAP_1H}%\n\n"
         f"<b>الأوامر:</b>\n"
-        f"/cross — فحص فوري\n"
+        f"/cross — فحص فوري (كل الفريمات)\n"
+        f"/cross15 — فحص 15m فقط\n"
+        f"/cross1h — فحص 1h فقط\n"
         f"/symbols — عرض الرموز\n"
         f"/status — حالة البوت",
         parse_mode="HTML",
     )
 
 
-async def cmd_cross(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _run_cross(update, timeframes_filter: list[str] | None = None):
     if _exchange is None:
         await update.message.reply_text("❌ المنصة غير مهيأة.")
         return
 
-    await update.message.reply_text("🔍 جاري الفحص...")
+    tfs = timeframes_filter or TIMEFRAMES
+    await update.message.reply_text(
+        f"🔍 جاري الفحص على: {', '.join(tfs)}..."
+    )
+
     found = 0
-
     for symbol in SYMBOLS:
-        # مسح الكاش لفحص فوري
-        _crossover_cache.pop(symbol, None)
-        cross = await detect_crossover(symbol)
-        if not cross:
-            continue
-
-        trend = await get_trend(symbol) if TREND_FILTER_ENABLED else None
-        msg = build_message(cross, trend)
-        try:
-            await update.message.reply_text(msg, parse_mode="HTML")
-            found += 1
-        except Exception as e:
-            log.error(f"send {symbol}: {e}")
+        for tf in tfs:
+            _crossover_cache.pop((symbol, tf), None)
+            cross = await detect_crossover(symbol, tf)
+            if not cross:
+                continue
+            try:
+                await update.message.reply_text(
+                    build_message(cross), parse_mode="HTML"
+                )
+                found += 1
+            except Exception as e:
+                log.error(f"send {symbol} {tf}: {e}")
 
     if found == 0:
         await update.message.reply_text(
-            f"⚪ لا توجد تقاطعات جديدة على {TIMEFRAME}"
+            f"⚪ لا تقاطعات قوية على {', '.join(tfs)}"
         )
+
+
+async def cmd_cross(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_cross(update)
+
+
+async def cmd_cross15(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_cross(update, ["15m"])
+
+
+async def cmd_cross1h(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_cross(update, ["1h"])
 
 
 async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -348,15 +358,17 @@ async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    source_status = _exchange.name if _exchange else "❌ فشل"
+    source = _exchange.name if _exchange else "❌ فشل"
+    cached_pairs = len(_crossover_cache)
     await update.message.reply_text(
         f"🤖 <b>حالة البوت</b>\n\n"
-        f"المصدر: <b>{source_status}</b>\n"
-        f"الفريم: {TIMEFRAME}\n"
+        f"المصدر: <b>{source}</b>\n"
+        f"الفريمات: {', '.join(TIMEFRAMES)}\n"
         f"EMA: {EMA_FAST}/{EMA_SLOW}\n"
         f"الرموز: {len(SYMBOLS)}\n"
+        f"أدنى فرق EMA: {MIN_EMA_GAP}%\n"
         f"الفحص: كل {JOB_INTERVAL_MIN} دقيقة\n"
-        f"في الكاش: {len(_crossover_cache)} رمز",
+        f"في الكاش: {cached_pairs} (رمز، فريم)",
         parse_mode="HTML",
     )
 
@@ -376,35 +388,37 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
     if _exchange is None:
         return
 
-    found = 0
+    total = 0
     for symbol in SYMBOLS:
-        try:
-            cross = await detect_crossover(symbol)
-            if not cross:
-                continue
+        for tf in TIMEFRAMES:
+            try:
+                cross = await detect_crossover(symbol, tf)
+                if not cross:
+                    continue
 
-            trend = await get_trend(symbol) if TREND_FILTER_ENABLED else None
-            msg = build_message(cross, trend)
+                msg = build_message(cross)
+                if CHAT_ID:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=CHAT_ID, text=msg, parse_mode="HTML"
+                        )
+                        emoji = "🚀" if cross["direction"] == "bullish" else "🔻"
+                        log.info(
+                            f"{emoji} {symbol} [{tf}] {cross['direction']} "
+                            f"| gap={cross['gap_pct']}% | {cross['strength']}"
+                        )
+                        total += 1
+                    except Exception as e:
+                        log.error(f"send {symbol} {tf}: {e}")
+            except Exception as e:
+                log.exception(f"job {symbol} {tf}: {e}")
 
-            if CHAT_ID:
-                try:
-                    await context.bot.send_message(
-                        chat_id=CHAT_ID, text=msg, parse_mode="HTML"
-                    )
-                    emoji = "🚀" if cross["direction"] == "bullish" else "🔻"
-                    log.info(f"{emoji} {symbol} → {cross['direction']}")
-                    found += 1
-                except Exception as e:
-                    log.error(f"إرسال {symbol}: {e}")
-        except Exception as e:
-            log.exception(f"crossover_job {symbol}: {e}")
-
-    if found:
-        log.info(f"📤 {found} تقاطع مرسل")
+    if total:
+        log.info(f"📤 {total} إشارة مُرسَلة")
 
 
 # ============================================================
-# Health Server
+# Health
 # ============================================================
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -424,7 +438,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
 def run_health():
     port = int(os.getenv("PORT", "8080"))
     HTTPServer(("0.0.0.0", port), _HealthHandler).serve_forever()
-    log.info(f"🩺 Health server على المنفذ {port}")
 
 
 # ============================================================
@@ -437,13 +450,16 @@ def main():
 
     threading.Thread(target=run_health, daemon=True).start()
 
-    print(f"🔀 Cross Bot يبدأ — المصدر: {EXCHANGE_NAME.upper()}")
-    print(f"📊 الرموز: {len(SYMBOLS)} | فريم: {TIMEFRAME} | EMA {EMA_FAST}/{EMA_SLOW}")
+    print(f"🔀 Cross Bot — المصدر: {EXCHANGE_NAME.upper()}")
+    print(f"📊 الرموز: {len(SYMBOLS)} | الفريمات: {', '.join(TIMEFRAMES)}")
+    print(f"📏 EMA {EMA_FAST}/{EMA_SLOW} | أدنى فرق: {MIN_EMA_GAP}%")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cross", cmd_cross))
+    app.add_handler(CommandHandler("cross15", cmd_cross15))
+    app.add_handler(CommandHandler("cross1h", cmd_cross1h))
     app.add_handler(CommandHandler("symbols", cmd_symbols))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_error_handler(error_handler)
@@ -455,7 +471,7 @@ def main():
             first=15,
             name="crossover",
         )
-        print(f"⏰ فحص التقاطع كل {JOB_INTERVAL_MIN} دقائق")
+        print(f"⏰ فحص كل {JOB_INTERVAL_MIN} دقائق")
 
     print("✅ جاهز")
     app.run_polling(
