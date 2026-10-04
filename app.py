@@ -1,5 +1,5 @@
 """
-بوت إشعارات متكامل (يدعم Spot و Futures):
+بوت إشعارات متكامل (Bybit / OKX / غيرها):
 1) تقاطع EMA — 3 فريمات + تصنيف قوة
 2) تنبيهات التغير المفاجئ في السعر — فحص كل دقيقة، 3 تنبيهات كحد أقصى
 3) تقرير صباحي — تحليل آخر 10 أيام واقتراح نطاق وعدد شبكات لبوت الشبكة
@@ -45,17 +45,18 @@ def _get_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in ("true", "1", "yes", "on")
 
 
-EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "binance").strip().lower()
+# ✅ Bybit كمنصة افتراضية
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "bybit").strip().lower()
 
-# ✅ نوع السوق: spot أو swap (عقود دائمة)
-MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()  # swap افتراضياً
+# ✅ نوع السوق
+MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()
 if MARKET_TYPE not in ("spot", "swap", "future"):
     MARKET_TYPE = "swap"
 
 # ============================================================
 # الرموز والفريمات
 # ============================================================
-# عند استخدام swap، تكون الرموز بالشكل: BTC/USDT:USDT
+# Bybit: الرموز بصيغة BASE/QUOTE:SETTLE
 _default_symbols = "BTC/USDT:USDT,XAG/USDT:USDT,XAU/USDT:USDT,XRP/USDT:USDT"
 _raw = os.getenv("SYMBOLS", "").strip()
 SYMBOLS = [
@@ -98,7 +99,7 @@ PRICE_CHANGE_THRESHOLDS = {
     "XAU/USDT": _get_float("THRESHOLD_XAU", 0.4),
     "PAXG/USDT": _get_float("THRESHOLD_XAU", 0.4),
     "XRP/USDT": _get_float("THRESHOLD_XRP", 1.5),
-    # Swap (Perpetual)
+    # Swap
     "BTC/USDT:USDT": _get_float("THRESHOLD_BTC", 1.0),
     "XAG/USDT:USDT": _get_float("THRESHOLD_XAG", 0.6),
     "XAU/USDT:USDT": _get_float("THRESHOLD_XAU", 0.4),
@@ -146,9 +147,17 @@ def init_exchange():
     options = {
         "enableRateLimit": True,
         "timeout": 30000,
-        # ✅ نوع السوق: swap لدعم العقود الدائمة
         "options": {"defaultType": MARKET_TYPE},
     }
+
+    # ✅ خيارات خاصة بكل منصة لتحسين الاتصال
+    if EXCHANGE_NAME == "bybit":
+        options["options"]["defaultType"] = MARKET_TYPE
+        # Bybit: تفعيل السوق الموحد إذا لزم
+        options["options"]["unifiedMargin"] = False
+    elif EXCHANGE_NAME == "okx":
+        options["options"]["defaultType"] = MARKET_TYPE
+
     mapping = {
         "okx": ccxt.okx,
         "bybit": ccxt.bybit,
@@ -156,16 +165,21 @@ def init_exchange():
         "kraken": ccxt.kraken,
         "binance": ccxt.binance,
         "coinbase": ccxt.coinbase,
+        "gate": ccxt.gate,
+        "bitget": ccxt.bitget,
     }
-    cls = mapping.get(EXCHANGE_NAME, ccxt.binance)
+    cls = mapping.get(EXCHANGE_NAME, ccxt.bybit)
+
     try:
         ex = cls(options)
-        # تحميل الأسواق للتحقق من صحة الرموز
         ex.load_markets()
-        log.info(f"✅ تم تهيئة {ex.name} (السوق: {MARKET_TYPE})")
+        log.info(f"✅ تم تهيئة {ex.name} (السوق: {MARKET_TYPE}) | "
+                 f"{len(ex.markets)} سوق متاح")
         return ex
     except Exception as e:
-        log.error(f"❌ فشل التهيئة: {e}")
+        log.error(f"❌ فشل التهيئة: {type(e).__name__}: {e}")
+        import traceback
+        log.error(traceback.format_exc())
         return None
 
 
@@ -220,10 +234,10 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150):
         log.warning(f"⚠️ رمز غير مدعوم: {symbol}")
         return None
     except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-        log.warning(f"⚠️ {symbol} {timeframe}: {e}")
+        log.warning(f"⚠️ {symbol} {timeframe}: {type(e).__name__}: {e}")
         return None
     except Exception as e:
-        log.warning(f"❌ {symbol}: {e}")
+        log.warning(f"❌ {symbol}: {type(e).__name__}: {e}")
         return None
 
 
@@ -351,8 +365,8 @@ async def detect_sudden_change(symbol: str) -> dict | None:
             "symbol": symbol,
             "direction": direction,
             "change_pct": round(change_pct, 2),
-            "current_price": round(current_price, 6),
-            "prev_price": round(prev_close, 6),
+            "current_price": round(current_price, 8),
+            "prev_price": round(prev_close, 8),
             "threshold": threshold,
             "alert_count": state["alert_count"],
             "max_alerts": MAX_PRICE_ALERTS,
@@ -394,8 +408,8 @@ async def analyze_range(symbol: str) -> dict | None:
     if span == 0:
         return None
 
-    lower = round(lowest - span * 0.05, 8)
-    upper = round(highest + span * 0.05, 8)
+    lower = round(lowest - span * 0.05, 10)
+    upper = round(highest + span * 0.05, 10)
     range_pct = ((upper - lower) / current) * 100 if current else 0
 
     if range_pct <= 0:
@@ -410,15 +424,15 @@ async def analyze_range(symbol: str) -> dict | None:
 
     return {
         "symbol": symbol,
-        "current": round(current, 8),
-        "highest": round(highest, 8),
-        "lowest": round(lowest, 8),
+        "current": round(current, 10),
+        "highest": round(highest, 10),
+        "lowest": round(lowest, 10),
         "suggested_lower": lower,
         "suggested_upper": upper,
         "range_pct": round(range_pct, 2),
         "atr_pct": round(atr_pct, 2),
         "grids": grids,
-        "grid_step": round(grid_step, 10),
+        "grid_step": round(grid_step, 12),
         "grid_step_pct": round(grid_step_pct, 3),
         "avg_volume": round(avg_volume, 2),
         "lookback": MORNING_REPORT_LOOKBACK_DAYS,
