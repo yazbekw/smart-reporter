@@ -1,6 +1,7 @@
 """
 بوت إشعارات تقاطع EMA — مصادر متعددة
-يدعم فريمين متوازيين (15m + 1h) + فلتر قوة
+يدعم 3 فريمات متوازية (5m + 15m + 1h) + تصنيف قوة
+يرسل كل التقاطعات مع ذكر قوتها
 """
 import os
 import re
@@ -44,10 +45,8 @@ def _get_bool(name: str, default: bool) -> bool:
 
 EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "okx").strip().lower()
 
-_default_symbols = (
-    "BTC/USDT,ETH/USDT,BNB/USDT,SOL/USDT,"
-    "XRP/USDT,ADA/USDT,AVAX/USDT,DOGE/USDT"
-)
+# ✅ الرموز المحدّثة (5 فقط)
+_default_symbols = "BTC/USDT,BNB/USDT,ETH/USDT,XRP/USDT,SOL/USDT"
 _raw = os.getenv("SYMBOLS", "").strip()
 SYMBOLS = [
     s.strip().upper()
@@ -55,24 +54,25 @@ SYMBOLS = [
     if s.strip()
 ]
 
-# الفريمات المدعومة
+# ✅ الفريمات المدعومة (أضفنا 5m)
 TIMEFRAMES = [
     t.strip()
-    for t in os.getenv("TIMEFRAMES", "15m,1h").split(",")
+    for t in os.getenv("TIMEFRAMES", "5m,15m,1h").split(",")
     if t.strip()
 ]
 
 EMA_FAST = _get_int("EMA_FAST", 7)
 EMA_SLOW = _get_int("EMA_SLOW", 25)
 
-JOB_INTERVAL_MIN = _get_int("JOB_INTERVAL_MIN", 5)
+JOB_INTERVAL_MIN = _get_int("JOB_INTERVAL_MIN", 2)
 
-# فلتر قوة التقاطع
-MIN_EMA_GAP = _get_float("MIN_EMA_GAP", 0.10)   # % أدنى فرق بين EMA
+# عتبة "الضعيفة" — للتصنيف فقط، لا تحجب الإشارات
+MIN_EMA_GAP = _get_float("MIN_EMA_GAP", 0.10)
 
-# مستويات تصنيف القوة (تُضاف فوق MIN_EMA_GAP)
+# ✅ عتبات القوة لكل فريم
+STRONG_GAP_5M  = _get_float("STRONG_GAP_5M", 0.25)
 STRONG_GAP_15M = _get_float("STRONG_GAP_15M", 0.20)
-STRONG_GAP_1H  = _get_float("STRONG_GAP_1H", 0.20)
+STRONG_GAP_1H  = _get_float("STRONG_GAP_1H", 0.30)
 
 SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
@@ -178,26 +178,42 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150):
 # ============================================================
 def classify_strength(timeframe: str, gap_pct: float) -> str:
     """
-    يُعيد وسم القوة بناءً على الفريم والفرق.
+    تصنيف قوة الإشارة حسب الفريم وفرق EMA.
+    كل التقاطعات تُرسَل، لكن يُذكر مستواها.
     """
     if timeframe == "1h":
         if gap_pct >= STRONG_GAP_1H:
             return "🔥 قوية جداً"
-        return "🟢 قوية"
-    else:  # 15m أو أي فريم قصير
-        if gap_pct >= STRONG_GAP_15M:
+        if gap_pct >= MIN_EMA_GAP:
             return "🟢 قوية"
         return "🟡 متوسطة"
 
+    if timeframe == "15m":
+        if gap_pct >= STRONG_GAP_15M:
+            return "🟢 قوية"
+        if gap_pct >= MIN_EMA_GAP:
+            return "🟡 متوسطة"
+        return "⚪ ضعيفة"
+
+    if timeframe == "5m":
+        if gap_pct >= STRONG_GAP_5M:
+            return "🟢 قوية"
+        if gap_pct >= MIN_EMA_GAP:
+            return "🟡 متوسطة"
+        return "⚪ ضعيفة"
+
+    # أي فريم آخر
+    if gap_pct >= STRONG_GAP_15M:
+        return "🟢 قوية"
+    if gap_pct >= MIN_EMA_GAP:
+        return "🟡 متوسطة"
+    return "⚪ ضعيفة"
+
 
 # ============================================================
-# اكتشاف التقاطع
+# اكتشاف التقاطع — يرسل كل التقاطعات (بدون حجب)
 # ============================================================
 async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
-    """
-    يكتشف التقاطع على فريم محدد.
-    مع فلتر فرق EMA الأدنى.
-    """
     ohlcv = await fetch_ohlcv(symbol, timeframe, EMA_SLOW + 50)
     if not ohlcv or len(ohlcv) < EMA_SLOW + 5:
         return None
@@ -221,13 +237,8 @@ async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
 
     direction = "bullish" if bullish else "bearish"
 
-    # فلتر فرق EMA
+    # ✅ نحسب الفرق ونصنّف — لكن لا نحجب
     gap_pct = abs(cf - cs) / cs * 100
-    if gap_pct < MIN_EMA_GAP:
-        log.info(
-            f"⏭️ {symbol} {timeframe}: فرق ضعيف {gap_pct:.3f}% < {MIN_EMA_GAP}%"
-        )
-        return None
 
     candle_ts = int(df["ts"].iloc[curr])
 
@@ -286,7 +297,7 @@ def build_message(cross: dict) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source = _exchange.name if _exchange else "❌ فشل"
     await update.message.reply_text(
-        f"🔀 <b>بوت تقاطع EMA — فريمين متوازيين</b>\n"
+        f"🔀 <b>بوت تقاطع EMA — 3 فريمات متوازية</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>الإعدادات:</b>\n"
         f"• المصدر: <b>{source}</b>\n"
@@ -294,10 +305,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• EMA: {EMA_FAST}/{EMA_SLOW}\n"
         f"• الرموز: {len(SYMBOLS)}\n"
         f"• الفحص: كل {JOB_INTERVAL_MIN} دقائق\n"
-        f"• أدنى فرق EMA: <b>{MIN_EMA_GAP}%</b>\n"
-        f"• عتبة القوة (15m): {STRONG_GAP_15M}% | (1h): {STRONG_GAP_1H}%\n\n"
+        f"• عتبات القوة — 5m: {STRONG_GAP_5M}% | "
+        f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n"
+        f"• عتبة الضعيفة: {MIN_EMA_GAP}%\n\n"
         f"<b>الأوامر:</b>\n"
         f"/cross — فحص فوري (كل الفريمات)\n"
+        f"/cross5 — فحص 5m فقط\n"
         f"/cross15 — فحص 15m فقط\n"
         f"/cross1h — فحص 1h فقط\n"
         f"/symbols — عرض الرموز\n"
@@ -333,12 +346,16 @@ async def _run_cross(update, timeframes_filter: list[str] | None = None):
 
     if found == 0:
         await update.message.reply_text(
-            f"⚪ لا تقاطعات قوية على {', '.join(tfs)}"
+            f"⚪ لا تقاطعات على {', '.join(tfs)}"
         )
 
 
 async def cmd_cross(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_cross(update)
+
+
+async def cmd_cross5(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _run_cross(update, ["5m"])
 
 
 async def cmd_cross15(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -366,7 +383,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"الفريمات: {', '.join(TIMEFRAMES)}\n"
         f"EMA: {EMA_FAST}/{EMA_SLOW}\n"
         f"الرموز: {len(SYMBOLS)}\n"
-        f"أدنى فرق EMA: {MIN_EMA_GAP}%\n"
+        f"عتبات القوة — 5m: {STRONG_GAP_5M}% | "
+        f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n"
         f"الفحص: كل {JOB_INTERVAL_MIN} دقيقة\n"
         f"في الكاش: {cached_pairs} (رمز، فريم)",
         parse_mode="HTML",
@@ -452,12 +470,15 @@ def main():
 
     print(f"🔀 Cross Bot — المصدر: {EXCHANGE_NAME.upper()}")
     print(f"📊 الرموز: {len(SYMBOLS)} | الفريمات: {', '.join(TIMEFRAMES)}")
-    print(f"📏 EMA {EMA_FAST}/{EMA_SLOW} | أدنى فرق: {MIN_EMA_GAP}%")
+    print(f"📏 EMA {EMA_FAST}/{EMA_SLOW}")
+    print(f"📐 عتبات القوة — 5m: {STRONG_GAP_5M}% | "
+          f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cross", cmd_cross))
+    app.add_handler(CommandHandler("cross5", cmd_cross5))
     app.add_handler(CommandHandler("cross15", cmd_cross15))
     app.add_handler(CommandHandler("cross1h", cmd_cross1h))
     app.add_handler(CommandHandler("symbols", cmd_symbols))
