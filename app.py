@@ -2,7 +2,7 @@
 بوت إشعارات متكامل (Bybit / OKX / غيرها):
 1) تقاطع EMA — 3 فريمات + تصنيف قوة
 2) تنبيهات التغير المفاجئ — فحص كل دقيقة، 3 تنبيهات كحد أقصى
-3) تقرير صباحي — نطاق مبني على ATR (أضيق وأكثر واقعية)
+3) تقرير صباحي — نطاق مبني على ATR اليومي (1d) + حد أقصى
 4) أمر /report لطلب التقرير في أي وقت
 """
 import os
@@ -45,7 +45,6 @@ def _get_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in ("true", "1", "yes", "on")
 
 
-# ✅ Bybit كمنصة افتراضية
 EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "bybit").strip().lower()
 
 MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()
@@ -112,8 +111,11 @@ MORNING_REPORT_LOOKBACK_DAYS = _get_int("MORNING_REPORT_LOOKBACK_DAYS", 10)
 MORNING_REPORT_MIN_GRIDS = _get_int("MORNING_REPORT_MIN_GRIDS", 15)
 MORNING_REPORT_MAX_GRIDS = _get_int("MORNING_REPORT_MAX_GRIDS", 35)
 
-# ✅ معامل ATR: كم يوم تقلب نريد تغطيته في النطاق
+# ✅ معامل ATR: كم يوم تقلب نريد تغطيته
 MORNING_REPORT_ATR_MULTIPLIER = _get_float("MORNING_REPORT_ATR_MULTIPLIER", 3.0)
+
+# ✅ حد أقصى لعرض النطاق %
+MORNING_REPORT_MAX_RANGE_PCT = _get_float("MORNING_REPORT_MAX_RANGE_PCT", 8.0)
 
 _morning_raw = os.getenv("MORNING_REPORT_SYMBOLS", "").strip()
 MORNING_SYMBOLS = [
@@ -385,45 +387,52 @@ async def detect_sudden_change(symbol: str) -> dict | None:
 
 
 # ============================================================
-# تحليل النطاق للتقرير الصباحي (بناءً على ATR)
+# تحليل النطاق للتقرير الصباحي (ATR على 1d مباشرة)
 # ============================================================
 async def analyze_range(symbol: str) -> dict | None:
-    limit = MORNING_REPORT_LOOKBACK_DAYS * 6 + 10
-    ohlcv = await fetch_ohlcv(symbol, "4h", limit)
-    if not ohlcv or len(ohlcv) < 30:
+    # ✅ نجلب شموع يومية لحساب ATR بدقة
+    ohlcv_1d = await fetch_ohlcv(symbol, "1d", MORNING_REPORT_LOOKBACK_DAYS + 20)
+    if not ohlcv_1d or len(ohlcv_1d) < 10:
         return None
 
-    df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
-    df = df.tail(MORNING_REPORT_LOOKBACK_DAYS * 6)
+    df = pd.DataFrame(ohlcv_1d, columns=["ts", "o", "h", "l", "c", "v"])
 
-    highest = float(df["h"].max())
-    lowest = float(df["l"].min())
     current = float(df["c"].iloc[-1])
-    avg_volume = float(df["v"].mean())
+    if current == 0:
+        return None
 
-    # ✅ ATR على فريم 4 ساعات
+    # ✅ ATR على الفريم اليومي (1d)
     df["tr"] = pd.concat([
         df["h"] - df["l"],
         (df["h"] - df["c"].shift()).abs(),
         (df["l"] - df["c"].shift()).abs(),
     ], axis=1).max(axis=1)
 
-    atr_4h = float(df["tr"].tail(30).mean())
+    atr_daily = float(df["tr"].tail(14).mean())
+    atr_daily_pct = (atr_daily / current) * 100
 
-    # ✅ ATR اليومي = 6 شموع × 4 ساعات
-    atr_daily = atr_4h * 6
-    atr_daily_pct = (atr_daily / current) * 100 if current else 0
+    # ✅ النطاق التاريخي لآخر N أيام
+    df_recent = df.tail(MORNING_REPORT_LOOKBACK_DAYS)
+    highest = float(df_recent["h"].max())
+    lowest = float(df_recent["l"].min())
+    avg_volume = float(df_recent["v"].mean())
 
-    # ✅ عرض النطاق = ATR اليومي × المعامل
+    # ✅ عرض النطاق = ATR يومي × المعامل
     span = atr_daily * MORNING_REPORT_ATR_MULTIPLIER
-
     if span <= 0:
         return None
 
     # ✅ النطاق متمركز حول السعر الحالي
     lower = current - (span / 2)
     upper = current + (span / 2)
-    range_pct = ((upper - lower) / current) * 100 if current else 0
+    range_pct = ((upper - lower) / current) * 100
+
+    # ✅ تطبيق الحد الأقصى لعرض النطاق
+    if range_pct > MORNING_REPORT_MAX_RANGE_PCT:
+        span = current * (MORNING_REPORT_MAX_RANGE_PCT / 100)
+        lower = current - (span / 2)
+        upper = current + (span / 2)
+        range_pct = MORNING_REPORT_MAX_RANGE_PCT
 
     if range_pct <= 0:
         return None
@@ -445,6 +454,7 @@ async def analyze_range(symbol: str) -> dict | None:
         "range_pct": round(range_pct, 2),
         "atr_pct": round(atr_daily_pct, 2),
         "atr_multiplier": MORNING_REPORT_ATR_MULTIPLIER,
+        "max_range_pct": MORNING_REPORT_MAX_RANGE_PCT,
         "grids": grids,
         "grid_step": grid_step,
         "grid_step_pct": round(grid_step_pct, 3),
@@ -509,9 +519,9 @@ def build_morning_report(analyses: list[dict], title: str = "🌅 التقرير
     header = (
         f"{title} — <b>النطاقات المقترحة</b>\n"
         f"🇸🇾 {syria_now_str()}\n"
-        f"📅 تحليل آخر <b>{MORNING_REPORT_LOOKBACK_DAYS}</b> أيام "
-        f"(فريم 4 ساعات)\n"
-        f"📐 المعادلة: ATR يومي × <b>{MORNING_REPORT_ATR_MULTIPLIER}</b>\n"
+        f"📅 تحليل آخر <b>{MORNING_REPORT_LOOKBACK_DAYS}</b> أيام\n"
+        f"📐 المعادلة: ATR يومي (1d) × <b>{MORNING_REPORT_ATR_MULTIPLIER}</b> "
+        f"| حد أقصى: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
     )
 
@@ -520,8 +530,8 @@ def build_morning_report(analyses: list[dict], title: str = "🌅 التقرير
         body += (
             f"\n💠 <b>{short(a['symbol'])}</b> — السعر الحالي: "
             f"<b>{fmt_price(a['current'])}</b>\n"
-            f"  📉 أدنى 10 أيام: {fmt_price(a['lowest'])}\n"
-            f"  📈 أعلى 10 أيام: {fmt_price(a['highest'])}\n"
+            f"  📉 أدنى {a['lookback']} أيام: {fmt_price(a['lowest'])}\n"
+            f"  📈 أعلى {a['lookback']} أيام: {fmt_price(a['highest'])}\n"
             f"  🎯 النطاق المقترح: <b>{fmt_price(a['suggested_lower'])} – "
             f"{fmt_price(a['suggested_upper'])}</b>\n"
             f"  📊 عرض النطاق: {a['range_pct']}%\n"
@@ -571,6 +581,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• الساعة: {MORNING_REPORT_HOUR}:00 (توقيت سوريا)\n"
         f"• الأيام: {MORNING_REPORT_LOOKBACK_DAYS}\n"
         f"• معامل ATR: {MORNING_REPORT_ATR_MULTIPLIER}\n"
+        f"• حد أقصى للنطاق: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
         f"• الرموز: {', '.join(short(s) for s in MORNING_SYMBOLS)}\n\n"
         f"<b>الأوامر:</b>\n"
         f"/cross — فحص تقاطعات (كل الفريمات)\n"
@@ -716,7 +727,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n"
         f"فحص التقاطعات: كل {JOB_INTERVAL_MIN} دقيقة\n"
         f"فحص التغيرات: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة\n"
-        f"معامل ATR للتقرير: {MORNING_REPORT_ATR_MULTIPLIER}\n"
+        f"معامل ATR: {MORNING_REPORT_ATR_MULTIPLIER} | "
+        f"حد أقصى للنطاق: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
         f"في الكاش: {cached_pairs} (رمز، فريم)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<b>حالة تنبيهات السعر:</b>\n{states_str}",
@@ -874,7 +886,8 @@ def main():
           f"{'✅ مفعل' if MORNING_REPORT_ENABLED else '❌ معطل'} | "
           f"الساعة {MORNING_REPORT_HOUR}:00 (سوريا) | "
           f"آخر {MORNING_REPORT_LOOKBACK_DAYS} أيام | "
-          f"معامل ATR: {MORNING_REPORT_ATR_MULTIPLIER}")
+          f"معامل ATR: {MORNING_REPORT_ATR_MULTIPLIER} | "
+          f"حد أقصى: {MORNING_REPORT_MAX_RANGE_PCT}%")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
