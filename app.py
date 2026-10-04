@@ -1,7 +1,8 @@
 """
-بوت إشعارات تقاطع EMA — مصادر متعددة
+بوت إشعارات تقاطع EMA + إشعارات التغير المفاجئ في السعر
 يدعم 3 فريمات متوازية (5m + 15m + 1h) + تصنيف قوة
 يرسل كل التقاطعات مع ذكر قوتها
++ يرسل 3 تنبيهات متتالية عند اكتشاف تغير مفاجئ، ثم يتوقف حتى يعود التغير طبيعياً
 """
 import os
 import re
@@ -45,8 +46,8 @@ def _get_bool(name: str, default: bool) -> bool:
 
 EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "okx").strip().lower()
 
-# ✅ الرموز المحدّثة (5 فقط)
-_default_symbols = "BTC/USDT,BNB/USDT,ETH/USDT,XRP/USDT,SOL/USDT"
+# ✅ الرموز المحدّثة (BTC كمؤشر عام، الذهب، الفضة، XRP)
+_default_symbols = "BTC/USDT,PAXG/USDT,XAG/USDT,XRP/USDT"
 _raw = os.getenv("SYMBOLS", "").strip()
 SYMBOLS = [
     s.strip().upper()
@@ -54,7 +55,7 @@ SYMBOLS = [
     if s.strip()
 ]
 
-# ✅ الفريمات المدعومة (أضفنا 5m)
+# ✅ الفريمات المدعومة
 TIMEFRAMES = [
     t.strip()
     for t in os.getenv("TIMEFRAMES", "5m,15m,1h").split(",")
@@ -73,6 +74,20 @@ MIN_EMA_GAP = _get_float("MIN_EMA_GAP", 0.10)
 STRONG_GAP_5M  = _get_float("STRONG_GAP_5M", 0.25)
 STRONG_GAP_15M = _get_float("STRONG_GAP_15M", 0.20)
 STRONG_GAP_1H  = _get_float("STRONG_GAP_1H", 0.30)
+
+# ✅ إعدادات إشعار التغير المفاجئ في السعر
+PRICE_ALERT_INTERVAL_MIN = _get_int("PRICE_ALERT_INTERVAL_MIN", 1)  # كل دقيقة
+MAX_PRICE_ALERTS = _get_int("MAX_PRICE_ALERTS", 3)  # إجمالي 3 تنبيهات
+
+# ✅ عتبات التغير المفاجئ لكل عملة (نسبة مئوية)
+PRICE_CHANGE_THRESHOLDS = {
+    "BTC/USDT": _get_float("THRESHOLD_BTC", 1.0),
+    "XAG/USDT": _get_float("THRESHOLD_XAG", 0.6),
+    "XAU/USDT": _get_float("THRESHOLD_XAU", 0.4),
+    "PAXG/USDT": _get_float("THRESHOLD_XAU", 0.4), # بديل الذهب
+    "XRP/USDT": _get_float("THRESHOLD_XRP", 1.5),
+}
+DEFAULT_THRESHOLD = _get_float("DEFAULT_THRESHOLD", 1.0)
 
 SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
@@ -97,6 +112,7 @@ def init_exchange():
     options = {
         "enableRateLimit": True,
         "timeout": 30000,
+        # ملاحظة: إذا كنت تتداول XAU/XAG كعقود دائمة، غيّر القيمة إلى 'swap'
         "options": {"defaultType": "spot"},
     }
     mapping = {
@@ -121,6 +137,9 @@ _exchange = init_exchange()
 
 # كاش: {(symbol, timeframe): {"direction":..., "candle_ts":...}}
 _crossover_cache: dict = {}
+
+# كاش إضافي: {symbol: {"direction":..., "alert_count":..., "alerting":...}} لإشعارات السعر
+_price_state: dict = {}
 
 
 # ============================================================
@@ -177,10 +196,6 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150):
 # تصنيف قوة الإشارة
 # ============================================================
 def classify_strength(timeframe: str, gap_pct: float) -> str:
-    """
-    تصنيف قوة الإشارة حسب الفريم وفرق EMA.
-    كل التقاطعات تُرسَل، لكن يُذكر مستواها.
-    """
     if timeframe == "1h":
         if gap_pct >= STRONG_GAP_1H:
             return "🔥 قوية جداً"
@@ -202,7 +217,6 @@ def classify_strength(timeframe: str, gap_pct: float) -> str:
             return "🟡 متوسطة"
         return "⚪ ضعيفة"
 
-    # أي فريم آخر
     if gap_pct >= STRONG_GAP_15M:
         return "🟢 قوية"
     if gap_pct >= MIN_EMA_GAP:
@@ -237,12 +251,10 @@ async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
 
     direction = "bullish" if bullish else "bearish"
 
-    # ✅ نحسب الفرق ونصنّف — لكن لا نحجب
     gap_pct = abs(cf - cs) / cs * 100
 
     candle_ts = int(df["ts"].iloc[curr])
 
-    # منع التكرار حسب (الرمز، الفريم)
     cache_key = (symbol, timeframe)
     last = _crossover_cache.get(cache_key)
     if last and last.get("candle_ts") == candle_ts and last.get("direction") == direction:
@@ -261,6 +273,68 @@ async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
         "strength": classify_strength(timeframe, gap_pct),
         "exchange": EXCHANGE_NAME.upper(),
     }
+
+
+# ============================================================
+# ✅ منطق إشعار التغير المفاجئ في السعر (محدث)
+# ============================================================
+async def detect_sudden_change(symbol: str) -> dict | None:
+    # نستخدم شموع 1m للكشف السريع
+    ohlcv = await fetch_ohlcv(symbol, "1m", 3)
+    if not ohlcv or len(ohlcv) < 2:
+        return None
+
+    prev_close = float(ohlcv[-2][4])
+    current_price = float(ohlcv[-1][4])
+
+    if prev_close == 0:
+        return None
+
+    change_pct = ((current_price - prev_close) / prev_close) * 100
+    threshold = PRICE_CHANGE_THRESHOLDS.get(symbol, DEFAULT_THRESHOLD)
+
+    state = _price_state.setdefault(symbol, {
+        "direction": None,
+        "alert_count": 0,
+        "alerting": False
+    })
+
+    if abs(change_pct) >= threshold:
+        direction = "up" if change_pct > 0 else "down"
+
+        # إذا تغير الاتجاه، نبدأ حالة جديدة
+        if state["direction"] != direction:
+            state["direction"] = direction
+            state["alert_count"] = 0
+            state["alerting"] = False
+
+        # إدارة عدد التنبيهات
+        if not state["alerting"]:
+            state["alerting"] = True
+            state["alert_count"] = 1
+        elif state["alert_count"] < MAX_PRICE_ALERTS:
+            state["alert_count"] += 1
+        else:
+            # وصلنا للحد الأقصى (3 تنبيهات)، لا نرسل حتى يعود التغير طبيعياً
+            return None
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "change_pct": round(change_pct, 2),
+            "current_price": round(current_price, 4),
+            "prev_price": round(prev_close, 4),
+            "threshold": threshold,
+            "alert_count": state["alert_count"],
+            "max_alerts": MAX_PRICE_ALERTS,
+        }
+    else:
+        # عاد التغير إلى طبيعته: نصفّر الحالة
+        state["direction"] = None
+        state["alert_count"] = 0
+        state["alerting"] = False
+
+    return None
 
 
 # ============================================================
@@ -291,28 +365,56 @@ def build_message(cross: dict) -> str:
     )
 
 
+def build_price_alert_message(alert: dict) -> str:
+    symbol = alert["symbol"]
+    is_up = alert["direction"] == "up"
+    emoji = "🚀" if is_up else "🔻"
+    title = "ارتفاع مفاجئ 🟢" if is_up else "انخفاض مفاجئ 🔴"
+
+    return (
+        f"{emoji} <b>تنبيه تغير مفاجئ — {short(symbol)}</b>\n"
+        f"🇸🇾 <b>{syria_now_str()}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>{title}</b>\n"
+        f"📈 نسبة التغير: <b>{alert['change_pct']}%</b>\n"
+        f"🎯 العتبة: {alert['threshold']}%\n"
+        f"🔔 التنبيه: <b>{alert['alert_count']} من {alert['max_alerts']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"• السعر الحالي: {alert['current_price']}\n"
+        f"• السعر السابق: {alert['prev_price']}\n"
+        f"• المصدر: {EXCHANGE_NAME.upper()}"
+    )
+
+
 # ============================================================
 # الأوامر
 # ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source = _exchange.name if _exchange else "❌ فشل"
+    thresholds_str = "\n".join([f"  • {short(k)}: {v}%" for k, v in PRICE_CHANGE_THRESHOLDS.items()])
+    
     await update.message.reply_text(
-        f"🔀 <b>بوت تقاطع EMA — 3 فريمات متوازية</b>\n"
+        f"🔀 <b>بوت تقاطع EMA + تنبيهات التغير المفاجئ</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>الإعدادات:</b>\n"
         f"• المصدر: <b>{source}</b>\n"
         f"• الفريمات: <b>{', '.join(TIMEFRAMES)}</b>\n"
         f"• EMA: {EMA_FAST}/{EMA_SLOW}\n"
         f"• الرموز: {len(SYMBOLS)}\n"
-        f"• الفحص: كل {JOB_INTERVAL_MIN} دقائق\n"
+        f"• الفحص الدوري: كل {JOB_INTERVAL_MIN} دقائق\n"
         f"• عتبات القوة — 5m: {STRONG_GAP_5M}% | "
         f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n"
         f"• عتبة الضعيفة: {MIN_EMA_GAP}%\n\n"
+        f"<b>🆕 تنبيهات التغير المفاجئ:</b>\n"
+        f"• الفحص: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة\n"
+        f"• إجمالي التنبيهات: {MAX_PRICE_ALERTS} تنبيهات\n"
+        f"• العتبات المخصصة:\n{thresholds_str}\n\n"
         f"<b>الأوامر:</b>\n"
         f"/cross — فحص فوري (كل الفريمات)\n"
         f"/cross5 — فحص 5m فقط\n"
         f"/cross15 — فحص 15m فقط\n"
         f"/cross1h — فحص 1h فقط\n"
+        f"/checkprice — فحص فوري للتغير المفاجئ\n"
         f"/symbols — عرض الرموز\n"
         f"/status — حالة البوت",
         parse_mode="HTML",
@@ -366,6 +468,29 @@ async def cmd_cross1h(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_cross(update, ["1h"])
 
 
+async def cmd_checkprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _exchange is None:
+        await update.message.reply_text("❌ المنصة غير مهيأة.")
+        return
+
+    await update.message.reply_text("🔍 جاري فحص التغيرات المفاجئة...")
+    found = 0
+    for symbol in SYMBOLS:
+        # ملاحظة: لا نقوم بتصفير الحالة هنا، بل نستخدم الحالة الحالية
+        alert = await detect_sudden_change(symbol)
+        if alert:
+            try:
+                await update.message.reply_text(
+                    build_price_alert_message(alert), parse_mode="HTML"
+                )
+                found += 1
+            except Exception as e:
+                log.error(f"send {symbol}: {e}")
+
+    if found == 0:
+        await update.message.reply_text("⚪ لا توجد تغيرات مفاجئة تتجاوز العتبات حالياً.")
+
+
 async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📋 <b>الرموز ({len(SYMBOLS)})</b>\n\n"
@@ -377,6 +502,18 @@ async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source = _exchange.name if _exchange else "❌ فشل"
     cached_pairs = len(_crossover_cache)
+    
+    # عرض حالة إشعارات السعر
+    states = []
+    for symbol in SYMBOLS:
+        st = _price_state.get(symbol, {"direction": None, "alert_count": 0, "alerting": False})
+        if st["alerting"]:
+            status = f"🔴 تنبيه ({st['alert_count']}/{MAX_PRICE_ALERTS})"
+        else:
+            status = "⚪ طبيعي"
+        states.append(f"• {short(symbol)}: {status}")
+    states_str = "\n".join(states)
+
     await update.message.reply_text(
         f"🤖 <b>حالة البوت</b>\n\n"
         f"المصدر: <b>{source}</b>\n"
@@ -386,7 +523,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"عتبات القوة — 5m: {STRONG_GAP_5M}% | "
         f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n"
         f"الفحص: كل {JOB_INTERVAL_MIN} دقيقة\n"
-        f"في الكاش: {cached_pairs} (رمز، فريم)",
+        f"في الكاش: {cached_pairs} (رمز، فريم)\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>🆕 حالة تنبيهات السعر:</b>\n{states_str}",
         parse_mode="HTML",
     )
 
@@ -435,6 +574,39 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
         log.info(f"📤 {total} إشارة مُرسَلة")
 
 
+# ✅ مهمة دورية جديدة لإشعارات التغير المفاجئ
+async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
+    if _exchange is None:
+        return
+
+    total = 0
+    for symbol in SYMBOLS:
+        try:
+            alert = await detect_sudden_change(symbol)
+            if not alert:
+                continue
+
+            msg = build_price_alert_message(alert)
+            if CHAT_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID, text=msg, parse_mode="HTML"
+                    )
+                    emoji = "🚀" if alert["direction"] == "up" else "🔻"
+                    log.info(
+                        f"{emoji} {symbol} {alert['direction']} "
+                        f"| change={alert['change_pct']}% | alert={alert['alert_count']}/{MAX_PRICE_ALERTS}"
+                    )
+                    total += 1
+                except Exception as e:
+                    log.error(f"send {symbol}: {e}")
+        except Exception as e:
+            log.exception(f"job price_alert {symbol}: {e}")
+
+    if total:
+        log.info(f"📤 {total} إشعار تغير مفاجئ مُرسَل")
+
+
 # ============================================================
 # Health
 # ============================================================
@@ -443,7 +615,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Cross Bot")
+        self.wfile.write(b"OK - Cross + Price Alert Bot")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -468,11 +640,13 @@ def main():
 
     threading.Thread(target=run_health, daemon=True).start()
 
-    print(f"🔀 Cross Bot — المصدر: {EXCHANGE_NAME.upper()}")
+    print(f"🔀 Cross + Price Alert Bot — المصدر: {EXCHANGE_NAME.upper()}")
     print(f"📊 الرموز: {len(SYMBOLS)} | الفريمات: {', '.join(TIMEFRAMES)}")
     print(f"📏 EMA {EMA_FAST}/{EMA_SLOW}")
     print(f"📐 عتبات القوة — 5m: {STRONG_GAP_5M}% | "
           f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%")
+    print(f"🆕 تنبيهات التغير: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة | "
+          f"الحد الأقصى: {MAX_PRICE_ALERTS} | العتبات: {PRICE_CHANGE_THRESHOLDS}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -481,18 +655,28 @@ def main():
     app.add_handler(CommandHandler("cross5", cmd_cross5))
     app.add_handler(CommandHandler("cross15", cmd_cross15))
     app.add_handler(CommandHandler("cross1h", cmd_cross1h))
+    app.add_handler(CommandHandler("checkprice", cmd_checkprice))
     app.add_handler(CommandHandler("symbols", cmd_symbols))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_error_handler(error_handler)
 
     if app.job_queue:
+        # مهمة تقاطع EMA (الاصلية)
         app.job_queue.run_repeating(
             crossover_job,
             interval=JOB_INTERVAL_MIN * 60,
             first=15,
             name="crossover",
         )
-        print(f"⏰ فحص كل {JOB_INTERVAL_MIN} دقائق")
+        # مهمة تنبيهات السعر (الجديدة) - كل دقيقة
+        app.job_queue.run_repeating(
+            price_alert_job,
+            interval=PRICE_ALERT_INTERVAL_MIN * 60,
+            first=20,
+            name="price_alert",
+        )
+        print(f"⏰ فحص التقاطعات كل {JOB_INTERVAL_MIN} دقائق")
+        print(f"⏰ فحص التغيرات المفاجئة كل {PRICE_ALERT_INTERVAL_MIN} دقيقة")
 
     print("✅ جاهز")
     app.run_polling(
