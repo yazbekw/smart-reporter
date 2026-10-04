@@ -1,9 +1,9 @@
 """
 بوت إشعارات متكامل (Bybit / OKX / غيرها):
 1) تقاطع EMA — 3 فريمات + تصنيف قوة
-2) تنبيهات التغير المفاجئ في السعر — فحص كل دقيقة، 3 تنبيهات كحد أقصى
-3) تقرير صباحي — تحليل آخر 10 أيام واقتراح نطاق وعدد شبكات لبوت الشبكة
-4) أمر /report لطلب التقرير يدوياً في أي وقت
+2) تنبيهات التغير المفاجئ — فحص كل دقيقة، 3 تنبيهات كحد أقصى
+3) تقرير صباحي — نطاق مبني على ATR (أضيق وأكثر واقعية)
+4) أمر /report لطلب التقرير في أي وقت
 """
 import os
 import re
@@ -48,7 +48,6 @@ def _get_bool(name: str, default: bool) -> bool:
 # ✅ Bybit كمنصة افتراضية
 EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "bybit").strip().lower()
 
-# ✅ نوع السوق
 MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()
 if MARKET_TYPE not in ("spot", "swap", "future"):
     MARKET_TYPE = "swap"
@@ -56,7 +55,6 @@ if MARKET_TYPE not in ("spot", "swap", "future"):
 # ============================================================
 # الرموز والفريمات
 # ============================================================
-# Bybit: الرموز بصيغة BASE/QUOTE:SETTLE
 _default_symbols = "BTC/USDT:USDT,XAG/USDT:USDT,XAU/USDT:USDT,XRP/USDT:USDT"
 _raw = os.getenv("SYMBOLS", "").strip()
 SYMBOLS = [
@@ -91,15 +89,12 @@ STRONG_GAP_1H  = _get_float("STRONG_GAP_1H", 0.30)
 PRICE_ALERT_INTERVAL_MIN = _get_int("PRICE_ALERT_INTERVAL_MIN", 1)
 MAX_PRICE_ALERTS = _get_int("MAX_PRICE_ALERTS", 3)
 
-# ✅ العتبات — تشمل صيغتي Spot و Swap
 PRICE_CHANGE_THRESHOLDS = {
-    # Spot
     "BTC/USDT": _get_float("THRESHOLD_BTC", 1.0),
     "XAG/USDT": _get_float("THRESHOLD_XAG", 0.6),
     "XAU/USDT": _get_float("THRESHOLD_XAU", 0.4),
     "PAXG/USDT": _get_float("THRESHOLD_XAU", 0.4),
     "XRP/USDT": _get_float("THRESHOLD_XRP", 1.5),
-    # Swap
     "BTC/USDT:USDT": _get_float("THRESHOLD_BTC", 1.0),
     "XAG/USDT:USDT": _get_float("THRESHOLD_XAG", 0.6),
     "XAU/USDT:USDT": _get_float("THRESHOLD_XAU", 0.4),
@@ -116,6 +111,9 @@ MORNING_REPORT_HOUR = _get_int("MORNING_REPORT_HOUR", 9)
 MORNING_REPORT_LOOKBACK_DAYS = _get_int("MORNING_REPORT_LOOKBACK_DAYS", 10)
 MORNING_REPORT_MIN_GRIDS = _get_int("MORNING_REPORT_MIN_GRIDS", 15)
 MORNING_REPORT_MAX_GRIDS = _get_int("MORNING_REPORT_MAX_GRIDS", 35)
+
+# ✅ معامل ATR: كم يوم تقلب نريد تغطيته في النطاق
+MORNING_REPORT_ATR_MULTIPLIER = _get_float("MORNING_REPORT_ATR_MULTIPLIER", 3.0)
 
 _morning_raw = os.getenv("MORNING_REPORT_SYMBOLS", "").strip()
 MORNING_SYMBOLS = [
@@ -150,13 +148,8 @@ def init_exchange():
         "options": {"defaultType": MARKET_TYPE},
     }
 
-    # ✅ خيارات خاصة بكل منصة لتحسين الاتصال
     if EXCHANGE_NAME == "bybit":
-        options["options"]["defaultType"] = MARKET_TYPE
-        # Bybit: تفعيل السوق الموحد إذا لزم
         options["options"]["unifiedMargin"] = False
-    elif EXCHANGE_NAME == "okx":
-        options["options"]["defaultType"] = MARKET_TYPE
 
     mapping = {
         "okx": ccxt.okx,
@@ -194,7 +187,6 @@ _price_state: dict = {}
 # أدوات مساعدة
 # ============================================================
 def short(symbol: str) -> str:
-    """يستخرج العملة الأساسية من رمز مثل BTC/USDT أو BTC/USDT:USDT."""
     return symbol.split("/")[0].split(":")[0].upper()
 
 
@@ -218,6 +210,19 @@ def syria_from_ts(ts_ms: int) -> str:
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
+
+
+def fmt_price(value: float) -> str:
+    """تنسيق السعر بعدد مناسب من الخانات العشرية."""
+    if value >= 1000:
+        return f"{value:.2f}"
+    if value >= 100:
+        return f"{value:.3f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    if value >= 0.01:
+        return f"{value:.5f}"
+    return f"{value:.8f}"
 
 
 # ============================================================
@@ -312,9 +317,9 @@ async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
         "symbol": symbol,
         "timeframe": timeframe,
         "direction": direction,
-        "ema_fast": round(cf, 6),
-        "ema_slow": round(cs, 6),
-        "price": round(float(df["c"].iloc[curr]), 6),
+        "ema_fast": round(cf, 8),
+        "ema_slow": round(cs, 8),
+        "price": round(float(df["c"].iloc[curr]), 8),
         "candle_ts": candle_ts,
         "gap_pct": round(gap_pct, 3),
         "strength": classify_strength(timeframe, gap_pct),
@@ -380,7 +385,7 @@ async def detect_sudden_change(symbol: str) -> dict | None:
 
 
 # ============================================================
-# تحليل النطاق للتقرير الصباحي
+# تحليل النطاق للتقرير الصباحي (بناءً على ATR)
 # ============================================================
 async def analyze_range(symbol: str) -> dict | None:
     limit = MORNING_REPORT_LOOKBACK_DAYS * 6 + 10
@@ -396,26 +401,34 @@ async def analyze_range(symbol: str) -> dict | None:
     current = float(df["c"].iloc[-1])
     avg_volume = float(df["v"].mean())
 
+    # ✅ ATR على فريم 4 ساعات
     df["tr"] = pd.concat([
         df["h"] - df["l"],
         (df["h"] - df["c"].shift()).abs(),
         (df["l"] - df["c"].shift()).abs(),
     ], axis=1).max(axis=1)
-    atr = float(df["tr"].tail(30).mean())
-    atr_pct = (atr / current) * 100 if current else 0
 
-    span = highest - lowest
-    if span == 0:
+    atr_4h = float(df["tr"].tail(30).mean())
+
+    # ✅ ATR اليومي = 6 شموع × 4 ساعات
+    atr_daily = atr_4h * 6
+    atr_daily_pct = (atr_daily / current) * 100 if current else 0
+
+    # ✅ عرض النطاق = ATR اليومي × المعامل
+    span = atr_daily * MORNING_REPORT_ATR_MULTIPLIER
+
+    if span <= 0:
         return None
 
-    lower = round(lowest - span * 0.05, 10)
-    upper = round(highest + span * 0.05, 10)
+    # ✅ النطاق متمركز حول السعر الحالي
+    lower = current - (span / 2)
+    upper = current + (span / 2)
     range_pct = ((upper - lower) / current) * 100 if current else 0
 
     if range_pct <= 0:
         return None
 
-    # كل شبكة ≥ 0.10%
+    # ✅ عدد الشبكات: كل شبكة ≥ 0.10%
     ideal_grids = int(range_pct / 0.10)
     grids = max(MORNING_REPORT_MIN_GRIDS, min(MORNING_REPORT_MAX_GRIDS, ideal_grids))
 
@@ -424,15 +437,16 @@ async def analyze_range(symbol: str) -> dict | None:
 
     return {
         "symbol": symbol,
-        "current": round(current, 10),
-        "highest": round(highest, 10),
-        "lowest": round(lowest, 10),
+        "current": current,
+        "highest": highest,
+        "lowest": lowest,
         "suggested_lower": lower,
         "suggested_upper": upper,
         "range_pct": round(range_pct, 2),
-        "atr_pct": round(atr_pct, 2),
+        "atr_pct": round(atr_daily_pct, 2),
+        "atr_multiplier": MORNING_REPORT_ATR_MULTIPLIER,
         "grids": grids,
-        "grid_step": round(grid_step, 12),
+        "grid_step": grid_step,
         "grid_step_pct": round(grid_step_pct, 3),
         "avg_volume": round(avg_volume, 2),
         "lookback": MORNING_REPORT_LOOKBACK_DAYS,
@@ -458,9 +472,9 @@ def build_message(cross: dict) -> str:
         f"⚡ القوة: <b>{cross['strength']}</b>\n"
         f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"• EMA{EMA_FAST}: {cross['ema_fast']}\n"
-        f"• EMA{EMA_SLOW}: {cross['ema_slow']}\n"
-        f"• السعر: {cross['price']}\n"
+        f"• EMA{EMA_FAST}: {fmt_price(cross['ema_fast'])}\n"
+        f"• EMA{EMA_SLOW}: {fmt_price(cross['ema_slow'])}\n"
+        f"• السعر: {fmt_price(cross['price'])}\n"
         f"• الفريم: <b>{tf}</b>\n"
         f"• وقت الشمعة: {candle_time}\n"
         f"• المصدر: {cross['exchange']} ({MARKET_TYPE})"
@@ -482,8 +496,8 @@ def build_price_alert_message(alert: dict) -> str:
         f"🎯 العتبة: {alert['threshold']}%\n"
         f"🔔 التنبيه: <b>{alert['alert_count']} من {alert['max_alerts']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"• السعر الحالي: {alert['current_price']}\n"
-        f"• السعر السابق: {alert['prev_price']}\n"
+        f"• السعر الحالي: {fmt_price(alert['current_price'])}\n"
+        f"• السعر السابق: {fmt_price(alert['prev_price'])}\n"
         f"• المصدر: {EXCHANGE_NAME.upper()} ({MARKET_TYPE})"
     )
 
@@ -495,20 +509,26 @@ def build_morning_report(analyses: list[dict], title: str = "🌅 التقرير
     header = (
         f"{title} — <b>النطاقات المقترحة</b>\n"
         f"🇸🇾 {syria_now_str()}\n"
-        f"📅 تحليل آخر <b>{MORNING_REPORT_LOOKBACK_DAYS}</b> أيام (فريم 4 ساعات)\n"
+        f"📅 تحليل آخر <b>{MORNING_REPORT_LOOKBACK_DAYS}</b> أيام "
+        f"(فريم 4 ساعات)\n"
+        f"📐 المعادلة: ATR يومي × <b>{MORNING_REPORT_ATR_MULTIPLIER}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
     )
 
     body = ""
     for a in analyses:
         body += (
-            f"\n💠 <b>{short(a['symbol'])}</b> — السعر الحالي: <b>{a['current']}</b>\n"
-            f"  📉 أدنى سعر: {a['lowest']}  |  📈 أعلى سعر: {a['highest']}\n"
-            f"  🎯 النطاق المقترح: <b>{a['suggested_lower']} – {a['suggested_upper']}</b>\n"
+            f"\n💠 <b>{short(a['symbol'])}</b> — السعر الحالي: "
+            f"<b>{fmt_price(a['current'])}</b>\n"
+            f"  📉 أدنى 10 أيام: {fmt_price(a['lowest'])}\n"
+            f"  📈 أعلى 10 أيام: {fmt_price(a['highest'])}\n"
+            f"  🎯 النطاق المقترح: <b>{fmt_price(a['suggested_lower'])} – "
+            f"{fmt_price(a['suggested_upper'])}</b>\n"
             f"  📊 عرض النطاق: {a['range_pct']}%\n"
-            f"  🌊 متوسط التقلب: {a['atr_pct']}%\n"
+            f"  🌊 تقلب يومي (ATR): {a['atr_pct']}%\n"
             f"  🔢 عدد الشبكات: <b>{a['grids']}</b>\n"
-            f"  📏 الفارق بين الشبكات: {a['grid_step']} ({a['grid_step_pct']}%)\n"
+            f"  📏 الفارق بين الشبكات: {fmt_price(a['grid_step'])} "
+            f"({a['grid_step_pct']}%)\n"
             f"  ──────────────────\n"
         )
 
@@ -526,7 +546,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source = _exchange.name if _exchange else "❌ فشل"
     thresholds_str = "\n".join([
         f"  • {short(k)}: {v}%" for k, v in PRICE_CHANGE_THRESHOLDS.items()
-        if ":" not in k  # نعرض Spot فقط لتجنب التكرار
+        if ":" not in k
     ])
 
     await update.message.reply_text(
@@ -550,6 +570,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• الحالة: {'✅ مفعل' if MORNING_REPORT_ENABLED else '❌ معطل'}\n"
         f"• الساعة: {MORNING_REPORT_HOUR}:00 (توقيت سوريا)\n"
         f"• الأيام: {MORNING_REPORT_LOOKBACK_DAYS}\n"
+        f"• معامل ATR: {MORNING_REPORT_ATR_MULTIPLIER}\n"
         f"• الرموز: {', '.join(short(s) for s in MORNING_SYMBOLS)}\n\n"
         f"<b>الأوامر:</b>\n"
         f"/cross — فحص تقاطعات (كل الفريمات)\n"
@@ -695,6 +716,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n"
         f"فحص التقاطعات: كل {JOB_INTERVAL_MIN} دقيقة\n"
         f"فحص التغيرات: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة\n"
+        f"معامل ATR للتقرير: {MORNING_REPORT_ATR_MULTIPLIER}\n"
         f"في الكاش: {cached_pairs} (رمز، فريم)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<b>حالة تنبيهات السعر:</b>\n{states_str}",
@@ -766,7 +788,8 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
                     emoji = "🚀" if alert["direction"] == "up" else "🔻"
                     log.info(
                         f"{emoji} {symbol} {alert['direction']} "
-                        f"| change={alert['change_pct']}% | alert={alert['alert_count']}/{MAX_PRICE_ALERTS}"
+                        f"| change={alert['change_pct']}% | "
+                        f"alert={alert['alert_count']}/{MAX_PRICE_ALERTS}"
                     )
                     total += 1
                 except Exception as e:
@@ -847,8 +870,11 @@ def main():
           f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%")
     print(f"🔔 تنبيهات التغير: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة | "
           f"الحد الأقصى: {MAX_PRICE_ALERTS}")
-    print(f"🌅 التقرير الصباحي: {'✅ مفعل' if MORNING_REPORT_ENABLED else '❌ معطل'} "
-          f"| الساعة {MORNING_REPORT_HOUR}:00 (سوريا) | آخر {MORNING_REPORT_LOOKBACK_DAYS} أيام")
+    print(f"🌅 التقرير الصباحي: "
+          f"{'✅ مفعل' if MORNING_REPORT_ENABLED else '❌ معطل'} | "
+          f"الساعة {MORNING_REPORT_HOUR}:00 (سوريا) | "
+          f"آخر {MORNING_REPORT_LOOKBACK_DAYS} أيام | "
+          f"معامل ATR: {MORNING_REPORT_ATR_MULTIPLIER}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -864,21 +890,18 @@ def main():
     app.add_error_handler(error_handler)
 
     if app.job_queue:
-        # 1) تقاطع EMA
         app.job_queue.run_repeating(
             crossover_job,
             interval=JOB_INTERVAL_MIN * 60,
             first=15,
             name="crossover",
         )
-        # 2) تنبيهات التغير المفاجئ
         app.job_queue.run_repeating(
             price_alert_job,
             interval=PRICE_ALERT_INTERVAL_MIN * 60,
             first=20,
             name="price_alert",
         )
-        # 3) التقرير الصباحي
         if MORNING_REPORT_ENABLED:
             from datetime import time as dt_time
             now_syria = datetime.now(SYRIA_TZ)
