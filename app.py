@@ -1,6 +1,6 @@
 """
 بوت إشعارات متكامل (Bybit / OKX / غيرها):
-1) تقاطع EMA — 3 فريمات + تصنيف قوة
+1) تقاطع EMA — 3 فريمات + كشف مبكر + مؤشرات داعمة
 2) تنبيهات التغير المفاجئ — فحص كل دقيقة، 3 تنبيهات كحد أقصى
 3) تقرير صباحي — نطاق مبني على ATR اليومي (1d) + حد أقصى
 4) أمر /report لطلب التقرير في أي وقت
@@ -83,6 +83,25 @@ STRONG_GAP_15M = _get_float("STRONG_GAP_15M", 0.20)
 STRONG_GAP_1H  = _get_float("STRONG_GAP_1H", 0.30)
 
 # ============================================================
+# إعدادات الكشف المبكر
+# ============================================================
+ENABLE_PRE_CROSS  = _get_bool("ENABLE_PRE_CROSS", True)   # 🔔 تحذير مبكر
+ENABLE_LIVE_CROSS = _get_bool("ENABLE_LIVE_CROSS", True)  # ⚡ تقاطع مبدئي
+ENABLE_CONFIRMED  = _get_bool("ENABLE_CONFIRMED", True)   # ✅ تقاطع مؤكد
+
+# عتبة "التقارب" — إذا كان الفرق أقل من هذه النسبة، يعتبر وشيكاً
+PRE_CROSS_GAP = _get_float("PRE_CROSS_GAP", 0.05)  # %
+
+# عدد الشموع المطلوبة للتحقق من أن التقارب "يتسارع"
+PRE_CROSS_LOOKBACK = _get_int("PRE_CROSS_LOOKBACK", 3)
+
+# فترة التهدئة: لا تكرر التحذير المبكر قبل N شمعة
+PRE_CROSS_COOLDOWN = _get_int("PRE_CROSS_COOLDOWN", 3)
+
+# كاش OHLCV — كم ثانية يُعتبر الكاش صالحاً
+OHLCV_CACHE_SECONDS = _get_int("OHLCV_CACHE_SECONDS", 30)
+
+# ============================================================
 # إعدادات تنبيهات التغير المفاجئ
 # ============================================================
 PRICE_ALERT_INTERVAL_MIN = _get_int("PRICE_ALERT_INTERVAL_MIN", 1)
@@ -111,10 +130,7 @@ MORNING_REPORT_LOOKBACK_DAYS = _get_int("MORNING_REPORT_LOOKBACK_DAYS", 10)
 MORNING_REPORT_MIN_GRIDS = _get_int("MORNING_REPORT_MIN_GRIDS", 15)
 MORNING_REPORT_MAX_GRIDS = _get_int("MORNING_REPORT_MAX_GRIDS", 35)
 
-# ✅ معامل ATR: كم يوم تقلب نريد تغطيته
 MORNING_REPORT_ATR_MULTIPLIER = _get_float("MORNING_REPORT_ATR_MULTIPLIER", 3.0)
-
-# ✅ حد أقصى لعرض النطاق %
 MORNING_REPORT_MAX_RANGE_PCT = _get_float("MORNING_REPORT_MAX_RANGE_PCT", 8.0)
 
 _morning_raw = os.getenv("MORNING_REPORT_SYMBOLS", "").strip()
@@ -183,6 +199,7 @@ _exchange = init_exchange()
 # كاشات
 _crossover_cache: dict = {}
 _price_state: dict = {}
+_ohlcv_cache: dict = {}
 
 
 # ============================================================
@@ -214,8 +231,58 @@ def calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 
+def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-9)
+    return 100 - (100 / (1 + rs))
+
+
+def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tr = pd.concat([
+        df["h"] - df["l"],
+        (df["h"] - df["c"].shift()).abs(),
+        (df["l"] - df["c"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def calc_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["h"]
+    low = df["l"]
+    close = df["c"]
+
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, 1e-9)
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, 1e-9)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9)
+    return dx.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def calc_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_f = series.ewm(span=fast, adjust=False).mean()
+    ema_s = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_f - ema_s
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
 def fmt_price(value: float) -> str:
-    """تنسيق السعر بعدد مناسب من الخانات العشرية."""
     if value >= 1000:
         return f"{value:.2f}"
     if value >= 100:
@@ -228,7 +295,7 @@ def fmt_price(value: float) -> str:
 
 
 # ============================================================
-# جلب الشموع
+# جلب الشموع + كاش
 # ============================================================
 async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150):
     if _exchange is None:
@@ -246,6 +313,24 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150):
     except Exception as e:
         log.warning(f"❌ {symbol}: {type(e).__name__}: {e}")
         return None
+
+
+async def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int = 150):
+    """كاش قصير الأمد لتقليل استهلاك rate limit."""
+    key = (symbol, timeframe, limit)
+    now = _time.time()
+    cached = _ohlcv_cache.get(key)
+    if cached and (now - cached["ts"]) < OHLCV_CACHE_SECONDS:
+        return cached["data"]
+
+    data = await fetch_ohlcv(symbol, timeframe, limit)
+    if data:
+        _ohlcv_cache[key] = {"data": data, "ts": now}
+    return data
+
+
+def clear_ohlcv_cache():
+    _ohlcv_cache.clear()
 
 
 # ============================================================
@@ -281,10 +366,116 @@ def classify_strength(timeframe: str, gap_pct: float) -> str:
 
 
 # ============================================================
-# اكتشاف تقاطع EMA
+# المؤشرات الداعمة (تُضاف لكل إشارة)
+# ============================================================
+def analyze_support(df: pd.DataFrame, curr_idx: int = -2) -> dict:
+    """
+    حساب المؤشرات الداعمة للإشارة — لا تُستخدم كفلتر، بل كمعلومات إضافية.
+    """
+    close = df["c"]
+    vol = df["v"]
+    current_price = float(close.iloc[curr_idx])
+
+    # ADX
+    try:
+        adx = float(calc_adx(df).iloc[curr_idx])
+    except Exception:
+        adx = 0
+    if adx >= 40:
+        adx_label = "اتجاه قوي جداً"
+    elif adx >= 25:
+        adx_label = "اتجاه واضح"
+    elif adx >= 20:
+        adx_label = "اتجاه ضعيف"
+    else:
+        adx_label = "سوق عرضي"
+
+    # Volume ratio
+    try:
+        start = max(0, len(df) + curr_idx - 20)
+        end = len(df) + curr_idx
+        vol_ma20 = float(vol.iloc[start:end].mean())
+        vol_curr = float(vol.iloc[curr_idx])
+        vol_ratio = vol_curr / vol_ma20 if vol_ma20 > 0 else 0
+    except Exception:
+        vol_ratio = 0
+    if vol_ratio >= 2.0:
+        vol_label = "قوي جداً"
+    elif vol_ratio >= 1.2:
+        vol_label = "جيد"
+    elif vol_ratio >= 0.7:
+        vol_label = "طبيعي"
+    else:
+        vol_label = "ضعيف"
+
+    # RSI
+    try:
+        rsi = float(calc_rsi(close).iloc[curr_idx])
+    except Exception:
+        rsi = 50
+    if rsi >= 70:
+        rsi_label = "تشبع شرائي"
+    elif rsi >= 55:
+        rsi_label = "زخم صاعد"
+    elif rsi >= 45:
+        rsi_label = "محايد"
+    elif rsi >= 30:
+        rsi_label = "زخم هابط"
+    else:
+        rsi_label = "تشبع بيعي"
+
+    # MACD histogram
+    try:
+        _, _, hist = calc_macd(close)
+        h_curr = float(hist.iloc[curr_idx])
+        h_prev = float(hist.iloc[curr_idx - 1])
+        rising = h_curr > h_prev
+        if h_curr > 0 and rising:
+            macd_label = "يتسارع صعوداً ↗"
+        elif h_curr > 0 and not rising:
+            macd_label = "يتباطأ صعوداً ↘"
+        elif h_curr < 0 and rising:
+            macd_label = "يتباطأ هبوطاً ↗"
+        else:
+            macd_label = "يتسارع هبوطاً ↘"
+    except Exception:
+        macd_label = "غير محدد"
+
+    # ATR %
+    try:
+        atr = float(calc_atr(df).iloc[curr_idx])
+        atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
+    except Exception:
+        atr_pct = 0
+
+    # HTF trend (EMA50 كنائب للاتجاه الأكبر)
+    try:
+        ema50 = float(calc_ema(close, 50).iloc[curr_idx])
+        htf_trend = "صاعد" if current_price > ema50 else "هابط"
+    except Exception:
+        htf_trend = "?"
+
+    return {
+        "adx": round(adx, 1),
+        "adx_label": adx_label,
+        "vol_ratio": round(vol_ratio, 2),
+        "vol_label": vol_label,
+        "rsi": round(rsi, 1),
+        "rsi_label": rsi_label,
+        "macd_label": macd_label,
+        "atr_pct": round(atr_pct, 2),
+        "htf_trend": htf_trend,
+    }
+
+
+# ============================================================
+# 1) اكتشاف التقاطع المؤكد (شمعة مغلقة -2)
 # ============================================================
 async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
-    ohlcv = await fetch_ohlcv(symbol, timeframe, EMA_SLOW + 50)
+    if not ENABLE_CONFIRMED:
+        return None
+
+    ohlcv = await fetch_ohlcv_cached(symbol, timeframe, EMA_SLOW + 60)
     if not ohlcv or len(ohlcv) < EMA_SLOW + 5:
         return None
 
@@ -301,7 +492,6 @@ async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
 
     bullish = (cf > cs) and (pf <= ps)
     bearish = (cf < cs) and (pf >= ps)
-
     if not (bullish or bearish):
         return None
 
@@ -326,6 +516,145 @@ async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
         "gap_pct": round(gap_pct, 3),
         "strength": classify_strength(timeframe, gap_pct),
         "exchange": EXCHANGE_NAME.upper(),
+        "market_type": MARKET_TYPE,
+        "alert_type": "confirmed",
+        "support": analyze_support(df, curr),
+    }
+
+
+# ============================================================
+# 2) اكتشاف التقاطع المبدئي (شمعة جارية -1)
+# ============================================================
+async def detect_live_crossover(symbol: str, timeframe: str) -> dict | None:
+    if not ENABLE_LIVE_CROSS:
+        return None
+
+    ohlcv = await fetch_ohlcv_cached(symbol, timeframe, EMA_SLOW + 60)
+    if not ohlcv or len(ohlcv) < EMA_SLOW + 5:
+        return None
+
+    df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
+    df["ef"] = calc_ema(df["c"], EMA_FAST)
+    df["es"] = calc_ema(df["c"], EMA_SLOW)
+
+    curr, prev = -1, -2
+
+    cf = float(df["ef"].iloc[curr])
+    cs = float(df["es"].iloc[curr])
+    pf = float(df["ef"].iloc[prev])
+    ps = float(df["es"].iloc[prev])
+
+    bullish = (cf > cs) and (pf <= ps)
+    bearish = (cf < cs) and (pf >= ps)
+    if not (bullish or bearish):
+        return None
+
+    direction = "bullish" if bullish else "bearish"
+    gap_pct = abs(cf - cs) / cs * 100
+    candle_ts = int(df["ts"].iloc[curr])
+
+    cache_key = (symbol, timeframe, "live")
+    last = _crossover_cache.get(cache_key)
+    if last and last.get("candle_ts") == candle_ts:
+        return None
+    _crossover_cache[cache_key] = {"direction": direction, "candle_ts": candle_ts}
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "direction": direction,
+        "ema_fast": round(cf, 8),
+        "ema_slow": round(cs, 8),
+        "price": round(float(df["c"].iloc[curr]), 8),
+        "candle_ts": candle_ts,
+        "gap_pct": round(gap_pct, 3),
+        "strength": "⚡ مبدئي (قابل للتغير)",
+        "exchange": EXCHANGE_NAME.upper(),
+        "market_type": MARKET_TYPE,
+        "alert_type": "live",
+        "support": analyze_support(df, curr),
+    }
+
+
+# ============================================================
+# 3) اكتشاف التقارب المبكر (قبل التقاطع)
+# ============================================================
+_TF_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+    "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+    "4h": 14_400_000, "1d": 86_400_000,
+}
+
+
+async def detect_pre_crossover(symbol: str, timeframe: str) -> dict | None:
+    if not ENABLE_PRE_CROSS:
+        return None
+
+    ohlcv = await fetch_ohlcv_cached(symbol, timeframe, EMA_SLOW + 60)
+    if not ohlcv or len(ohlcv) < EMA_SLOW + 10:
+        return None
+
+    df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
+    df["ef"] = calc_ema(df["c"], EMA_FAST)
+    df["es"] = calc_ema(df["c"], EMA_SLOW)
+
+    curr = -2
+
+    cf = float(df["ef"].iloc[curr])
+    cs = float(df["es"].iloc[curr])
+    gap_pct = abs(cf - cs) / cs * 100
+
+    # الشرط 1: الفرق صغير
+    if gap_pct >= PRE_CROSS_GAP:
+        return None
+
+    # الشرط 2: الفرق يتقلص
+    gaps = []
+    for i in range(PRE_CROSS_LOOKBACK):
+        idx = curr - i
+        f = float(df["ef"].iloc[idx])
+        s = float(df["es"].iloc[idx])
+        gaps.append(abs(f - s) / s * 100)
+
+    gaps_chrono = list(reversed(gaps))
+    is_converging = all(
+        gaps_chrono[i] >= gaps_chrono[i + 1]
+        for i in range(len(gaps_chrono) - 1)
+    )
+    if not is_converging:
+        return None
+
+    # الشرط 3: لم يعبر بعد
+    if abs(cf - cs) < 1e-9:
+        return None
+
+    direction = "bullish" if cf < cs else "bearish"
+    candle_ts = int(df["ts"].iloc[curr])
+
+    # cooldown للتحذير المبكر
+    cache_key = (symbol, timeframe, "pre")
+    last = _crossover_cache.get(cache_key)
+    if last:
+        last_ts = last.get("candle_ts", 0)
+        tf_ms = _TF_MS.get(timeframe, 900_000)
+        if candle_ts - last_ts < tf_ms * PRE_CROSS_COOLDOWN:
+            return None
+    _crossover_cache[cache_key] = {"direction": direction, "candle_ts": candle_ts}
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "direction": direction,
+        "ema_fast": round(cf, 8),
+        "ema_slow": round(cs, 8),
+        "price": round(float(df["c"].iloc[curr]), 8),
+        "candle_ts": candle_ts,
+        "gap_pct": round(gap_pct, 3),
+        "strength": "🔔 تقارب وشيك",
+        "exchange": EXCHANGE_NAME.upper(),
+        "market_type": MARKET_TYPE,
+        "alert_type": "pre",
+        "support": analyze_support(df, curr),
     }
 
 
@@ -387,10 +716,9 @@ async def detect_sudden_change(symbol: str) -> dict | None:
 
 
 # ============================================================
-# تحليل النطاق للتقرير الصباحي (ATR على 1d مباشرة)
+# تحليل النطاق للتقرير الصباحي (ATR على 1d)
 # ============================================================
 async def analyze_range(symbol: str) -> dict | None:
-    # ✅ نجلب شموع يومية لحساب ATR بدقة
     ohlcv_1d = await fetch_ohlcv(symbol, "1d", MORNING_REPORT_LOOKBACK_DAYS + 20)
     if not ohlcv_1d or len(ohlcv_1d) < 10:
         return None
@@ -401,7 +729,6 @@ async def analyze_range(symbol: str) -> dict | None:
     if current == 0:
         return None
 
-    # ✅ ATR على الفريم اليومي (1d)
     df["tr"] = pd.concat([
         df["h"] - df["l"],
         (df["h"] - df["c"].shift()).abs(),
@@ -411,23 +738,19 @@ async def analyze_range(symbol: str) -> dict | None:
     atr_daily = float(df["tr"].tail(14).mean())
     atr_daily_pct = (atr_daily / current) * 100
 
-    # ✅ النطاق التاريخي لآخر N أيام
     df_recent = df.tail(MORNING_REPORT_LOOKBACK_DAYS)
     highest = float(df_recent["h"].max())
     lowest = float(df_recent["l"].min())
     avg_volume = float(df_recent["v"].mean())
 
-    # ✅ عرض النطاق = ATR يومي × المعامل
     span = atr_daily * MORNING_REPORT_ATR_MULTIPLIER
     if span <= 0:
         return None
 
-    # ✅ النطاق متمركز حول السعر الحالي
     lower = current - (span / 2)
     upper = current + (span / 2)
     range_pct = ((upper - lower) / current) * 100
 
-    # ✅ تطبيق الحد الأقصى لعرض النطاق
     if range_pct > MORNING_REPORT_MAX_RANGE_PCT:
         span = current * (MORNING_REPORT_MAX_RANGE_PCT / 100)
         lower = current - (span / 2)
@@ -437,7 +760,6 @@ async def analyze_range(symbol: str) -> dict | None:
     if range_pct <= 0:
         return None
 
-    # ✅ عدد الشبكات: كل شبكة ≥ 0.10%
     ideal_grids = int(range_pct / 0.10)
     grids = max(MORNING_REPORT_MIN_GRIDS, min(MORNING_REPORT_MAX_GRIDS, ideal_grids))
 
@@ -470,24 +792,56 @@ def build_message(cross: dict) -> str:
     symbol = cross["symbol"]
     tf = cross["timeframe"]
     is_bull = (cross["direction"] == "bullish")
-    emoji = "🚀" if is_bull else "🔻"
-    title = "تقاطع صاعد 🟢" if is_bull else "تقاطع هابط 🔴"
+    alert_type = cross.get("alert_type", "confirmed")
+
+    if alert_type == "pre":
+        emoji = "🔔"
+        title = "تقارب وشيك — تحذير مبكر"
+        type_label = "🔔 <b>تحذير مبكر</b> — لم يحدث التقاطع بعد"
+        dir_label = "🟢 اتجاه محتمل: صاعد" if is_bull else "🔴 اتجاه محتمل: هابط"
+    elif alert_type == "live":
+        emoji = "⚡"
+        title = "تقاطع مبدئي"
+        type_label = "⚡ <b>تقاطع مبدئي</b> — على الشمعة الجارية"
+        dir_label = "🟢 صاعد" if is_bull else "🔴 هابط"
+    else:
+        emoji = "🚀" if is_bull else "🔻"
+        title = "تقاطع صاعد 🟢" if is_bull else "تقاطع هابط 🔴"
+        type_label = "✅ <b>تقاطع مؤكد</b> — على شمعة مغلقة"
+        dir_label = "🟢 صاعد" if is_bull else "🔴 هابط"
+
     candle_time = syria_from_ts(cross["candle_ts"])
+    s = cross.get("support", {})
+
+    support_block = ""
+    if s:
+        support_block = (
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📌 مؤشرات داعمة:</b>\n"
+            f"• ADX: <b>{s.get('adx', '?')}</b> — {s.get('adx_label', '?')}\n"
+            f"• RSI: <b>{s.get('rsi', '?')}</b> — {s.get('rsi_label', '?')}\n"
+            f"• MACD: {s.get('macd_label', '?')}\n"
+            f"• الحجم: <b>{s.get('vol_ratio', '?')}×</b> — {s.get('vol_label', '?')}\n"
+            f"• ATR: {s.get('atr_pct', '?')}%\n"
+            f"• اتجاه EMA50: {s.get('htf_trend', '?')}\n"
+        )
 
     return (
-        f"{emoji} <b>تقاطع EMA — {short(symbol)} [{tf}]</b>\n"
+        f"{emoji} <b>{title} — {short(symbol)} [{tf}]</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>{title}</b>\n"
+        f"{type_label}\n"
+        f"📊 <b>{dir_label}</b>\n"
         f"⚡ القوة: <b>{cross['strength']}</b>\n"
         f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
+        f"{support_block}"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"• EMA{EMA_FAST}: {fmt_price(cross['ema_fast'])}\n"
         f"• EMA{EMA_SLOW}: {fmt_price(cross['ema_slow'])}\n"
         f"• السعر: {fmt_price(cross['price'])}\n"
         f"• الفريم: <b>{tf}</b>\n"
         f"• وقت الشمعة: {candle_time}\n"
-        f"• المصدر: {cross['exchange']} ({MARKET_TYPE})"
+        f"• المصدر: {cross['exchange']} ({cross.get('market_type', MARKET_TYPE)})"
     )
 
 
@@ -560,7 +914,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     await update.message.reply_text(
-        f"🔀 <b>بوت متكامل — تقاطع EMA + تنبيهات + تقرير صباحي</b>\n"
+        f"🔀 <b>بوت متكامل — تقاطع EMA + كشف مبكر + تنبيهات</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>الإعدادات:</b>\n"
         f"• المصدر: <b>{source}</b>\n"
@@ -570,8 +924,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• الرموز: {len(SYMBOLS)}\n"
         f"• فحص التقاطعات: كل {JOB_INTERVAL_MIN} دقائق\n"
         f"• عتبات القوة — 5m: {STRONG_GAP_5M}% | "
-        f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n"
-        f"• عتبة الضعيفة: {MIN_EMA_GAP}%\n\n"
+        f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n\n"
+        f"<b>🔔 الكشف المبكر:</b>\n"
+        f"• تحذير مبكر: {'✅' if ENABLE_PRE_CROSS else '❌'} "
+        f"(عتبة التقارب: {PRE_CROSS_GAP}%)\n"
+        f"• تقاطع مبدئي: {'✅' if ENABLE_LIVE_CROSS else '❌'}\n"
+        f"• تقاطع مؤكد: {'✅' if ENABLE_CONFIRMED else '❌'}\n\n"
         f"<b>🔔 تنبيهات التغير المفاجئ:</b>\n"
         f"• الفحص: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة\n"
         f"• إجمالي التنبيهات: {MAX_PRICE_ALERTS}\n"
@@ -581,12 +939,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• الساعة: {MORNING_REPORT_HOUR}:00 (توقيت سوريا)\n"
         f"• الأيام: {MORNING_REPORT_LOOKBACK_DAYS}\n"
         f"• معامل ATR: {MORNING_REPORT_ATR_MULTIPLIER}\n"
-        f"• حد أقصى للنطاق: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
-        f"• الرموز: {', '.join(short(s) for s in MORNING_SYMBOLS)}\n\n"
+        f"• حد أقصى للنطاق: {MORNING_REPORT_MAX_RANGE_PCT}%\n\n"
         f"<b>الأوامر:</b>\n"
-        f"/cross — فحص تقاطعات (كل الفريمات)\n"
-        f"/cross5 /cross15 /cross1h — فحص فريم واحد\n"
-        f"/checkprice — فحص فوري للتغيرات المفاجئة\n"
+        f"/cross — فحص شامل (مبكر + مبدئي + مؤكد)\n"
+        f"/cross5 /cross15 /cross1h — فريم واحد\n"
+        f"/checkprice — فحص التغيرات المفاجئة\n"
         f"/report — التقرير الصباحي فوراً\n"
         f"/symbols — عرض الرموز\n"
         f"/status — حالة البوت",
@@ -600,23 +957,45 @@ async def _run_cross(update, timeframes_filter: list[str] | None = None):
         return
 
     tfs = timeframes_filter or TIMEFRAMES
-    await update.message.reply_text(f"🔍 جاري الفحص على: {', '.join(tfs)}...")
+    await update.message.reply_text(
+        f"🔍 جاري الفحص الشامل على: {', '.join(tfs)}..."
+    )
+
+    # مسح الكاش لضمان بيانات حديثة
+    clear_ohlcv_cache()
+
+    detectors = []
+    if ENABLE_PRE_CROSS:
+        detectors.append(detect_pre_crossover)
+    if ENABLE_LIVE_CROSS:
+        detectors.append(detect_live_crossover)
+    if ENABLE_CONFIRMED:
+        detectors.append(detect_crossover)
 
     found = 0
     for symbol in SYMBOLS:
         for tf in tfs:
+            # مسح كاش الإشارات لهذا الزوج
             _crossover_cache.pop((symbol, tf), None)
-            cross = await detect_crossover(symbol, tf)
-            if not cross:
-                continue
-            try:
-                await update.message.reply_text(build_message(cross), parse_mode="HTML")
-                found += 1
-            except Exception as e:
-                log.error(f"send {symbol} {tf}: {e}")
+            _crossover_cache.pop((symbol, tf, "pre"), None)
+            _crossover_cache.pop((symbol, tf, "live"), None)
+
+            for detector in detectors:
+                cross = await detector(symbol, tf)
+                if not cross:
+                    continue
+                try:
+                    await update.message.reply_text(
+                        build_message(cross), parse_mode="HTML"
+                    )
+                    found += 1
+                except Exception as e:
+                    log.error(f"send {symbol} {tf}: {e}")
 
     if found == 0:
-        await update.message.reply_text(f"⚪ لا تقاطعات على {', '.join(tfs)}")
+        await update.message.reply_text(
+            f"⚪ لا إشارات على {', '.join(tfs)}"
+        )
 
 
 async def cmd_cross(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -658,7 +1037,6 @@ async def cmd_checkprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """طلب التقرير الصباحي في أي وقت."""
     if _exchange is None:
         await update.message.reply_text("❌ المنصة غير مهيأة.")
         return
@@ -705,6 +1083,7 @@ async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source = _exchange.name if _exchange else "❌ فشل"
     cached_pairs = len(_crossover_cache)
+    cached_ohlcv = len(_ohlcv_cache)
 
     states = []
     for symbol in SYMBOLS:
@@ -723,13 +1102,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"الفريمات: {', '.join(TIMEFRAMES)}\n"
         f"EMA: {EMA_FAST}/{EMA_SLOW}\n"
         f"الرموز: {len(SYMBOLS)}\n"
-        f"عتبات القوة — 5m: {STRONG_GAP_5M}% | "
-        f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%\n"
         f"فحص التقاطعات: كل {JOB_INTERVAL_MIN} دقيقة\n"
         f"فحص التغيرات: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة\n"
-        f"معامل ATR: {MORNING_REPORT_ATR_MULTIPLIER} | "
-        f"حد أقصى للنطاق: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
-        f"في الكاش: {cached_pairs} (رمز، فريم)\n"
+        f"<b>الكشف المبكر:</b>\n"
+        f"• تحذير مبكر: {'✅' if ENABLE_PRE_CROSS else '❌'} "
+        f"(عتبة {PRE_CROSS_GAP}% | cooldown {PRE_CROSS_COOLDOWN} شموع)\n"
+        f"• تقاطع مبدئي: {'✅' if ENABLE_LIVE_CROSS else '❌'}\n"
+        f"• تقاطع مؤكد: {'✅' if ENABLE_CONFIRMED else '❌'}\n"
+        f"في كاش الإشارات: {cached_pairs}\n"
+        f"في كاش OHLCV: {cached_ohlcv}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<b>حالة تنبيهات السعر:</b>\n{states_str}",
         parse_mode="HTML",
@@ -751,33 +1132,50 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
     if _exchange is None:
         return
 
+    detectors = []
+    if ENABLE_PRE_CROSS:
+        detectors.append(detect_pre_crossover)
+    if ENABLE_LIVE_CROSS:
+        detectors.append(detect_live_crossover)
+    if ENABLE_CONFIRMED:
+        detectors.append(detect_crossover)
+
     total = 0
+    counts = {"pre": 0, "live": 0, "confirmed": 0}
+
     for symbol in SYMBOLS:
         for tf in TIMEFRAMES:
-            try:
-                cross = await detect_crossover(symbol, tf)
-                if not cross:
-                    continue
+            for detector in detectors:
+                try:
+                    cross = await detector(symbol, tf)
+                    if not cross:
+                        continue
 
-                msg = build_message(cross)
-                if CHAT_ID:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=CHAT_ID, text=msg, parse_mode="HTML"
-                        )
-                        emoji = "🚀" if cross["direction"] == "bullish" else "🔻"
-                        log.info(
-                            f"{emoji} {symbol} [{tf}] {cross['direction']} "
-                            f"| gap={cross['gap_pct']}% | {cross['strength']}"
-                        )
-                        total += 1
-                    except Exception as e:
-                        log.error(f"send {symbol} {tf}: {e}")
-            except Exception as e:
-                log.exception(f"job {symbol} {tf}: {e}")
+                    msg = build_message(cross)
+                    if CHAT_ID:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=CHAT_ID, text=msg, parse_mode="HTML"
+                            )
+                            log.info(
+                                f"[{cross['alert_type']}] {symbol} [{tf}] "
+                                f"{cross['direction']} | gap={cross['gap_pct']}% "
+                                f"| {cross['strength']}"
+                            )
+                            counts[cross["alert_type"]] = counts.get(cross["alert_type"], 0) + 1
+                            total += 1
+                        except Exception as e:
+                            log.error(f"send {symbol} {tf}: {e}")
+                except Exception as e:
+                    log.exception(f"job {symbol} {tf}: {e}")
 
     if total:
-        log.info(f"📤 {total} إشارة مُرسَلة")
+        log.info(
+            f"📤 {total} إشارة مُرسَلة "
+            f"(pre={counts.get('pre', 0)}, "
+            f"live={counts.get('live', 0)}, "
+            f"confirmed={counts.get('confirmed', 0)})"
+        )
 
 
 async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
@@ -880,6 +1278,12 @@ def main():
     print(f"📏 EMA {EMA_FAST}/{EMA_SLOW}")
     print(f"📐 عتبات القوة — 5m: {STRONG_GAP_5M}% | "
           f"15m: {STRONG_GAP_15M}% | 1h: {STRONG_GAP_1H}%")
+    print(f"🔔 الكشف المبكر: "
+          f"pre={'✅' if ENABLE_PRE_CROSS else '❌'} "
+          f"live={'✅' if ENABLE_LIVE_CROSS else '❌'} "
+          f"confirmed={'✅' if ENABLE_CONFIRMED else '❌'} "
+          f"| عتبة التقارب: {PRE_CROSS_GAP}%")
+    print(f"💾 كاش OHLCV: {OHLCV_CACHE_SECONDS} ثانية")
     print(f"🔔 تنبيهات التغير: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة | "
           f"الحد الأقصى: {MAX_PRICE_ALERTS}")
     print(f"🌅 التقرير الصباحي: "
