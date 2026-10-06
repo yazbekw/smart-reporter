@@ -9,6 +9,9 @@
 - فلتر إلزامي للحجم / ADX / ATR / EMA50 / 15m
 - منع الإشارات الضعيفة تلقائياً
 - إحصائيات فلترة في اللوج و /status
+- حماية Rate Limit: retry + backoff + cooldown + global pause
+- كاش 90 ثانية + تأخير بين الطلبات
+- أمر /clearcache لإصلاح يدوي
 """
 import os
 import re
@@ -85,33 +88,38 @@ ENABLE_CONFIRMED  = _get_bool("ENABLE_CONFIRMED", True)
 PRE_CROSS_GAP = _get_float("PRE_CROSS_GAP", 0.05)
 PRE_CROSS_LOOKBACK = _get_int("PRE_CROSS_LOOKBACK", 3)
 PRE_CROSS_COOLDOWN = _get_int("PRE_CROSS_COOLDOWN", 3)
-OHLCV_CACHE_SECONDS = _get_int("OHLCV_CACHE_SECONDS", 30)
+
+# 🆕 زيادة الكاش لتقليل الطلبات على Bybit
+OHLCV_CACHE_SECONDS = _get_int("OHLCV_CACHE_SECONDS", 90)
 
 # ============================================================
 # إعدادات نظام العلامة (Score)
 # ============================================================
-# الوضع: silent (يرسل الكل مع علامة) | strict (يحجب أقل من MIN_SCORE) | hybrid
 SCORE_MODE = os.getenv("SCORE_MODE", "silent").strip().lower()
-
-# العتبة الدنيا (تُطبَّق في strict و hybrid)
 MIN_SCORE = _get_float("MIN_SCORE", 55)
-
-# عتبة "الإشارة الذهبية" (في hybrid تُرسَل فوراً بإشعار قوي)
 GOLD_SCORE = _get_float("GOLD_SCORE", 80)
-
-# في hybrid: كل كم دقيقة يُرسَل ملخص الإشارات المحجوبة
 HYBRID_DIGEST_MIN = _get_int("HYBRID_DIGEST_MIN", 60)
 
 # ============================================================
-# 🆕 فلتر الجودة الإلزامي (يطبق في كل الأوضاع)
+# فلتر الجودة الإلزامي (يطبق في كل الأوضاع)
 # ============================================================
 ENABLE_HARD_FILTER = _get_bool("ENABLE_HARD_FILTER", True)
-MIN_VOL_RATIO      = _get_float("MIN_VOL_RATIO", 1.0)       # الحجم لا يقل عن المتوسط
-MIN_ADX_HARD       = _get_float("MIN_ADX_HARD", 18.0)        # أدنى ADX مقبول
-MAX_ATR_PCT_HARD   = _get_float("MAX_ATR_PCT_HARD", 0.70)    # تقلب مرتفع = ضوضاء
-BLOCK_AGAINST_HTF  = _get_bool("BLOCK_AGAINST_HTF", True)    # منع ضد EMA50
-BLOCK_TF_15M_LOW   = _get_bool("BLOCK_TF_15M_LOW", True)     # 15m يشترط علامة أعلى
-MIN_SCORE_15M      = _get_float("MIN_SCORE_15M", 65)         # عتبة خاصة بـ 15m
+MIN_VOL_RATIO      = _get_float("MIN_VOL_RATIO", 1.0)
+MIN_ADX_HARD       = _get_float("MIN_ADX_HARD", 18.0)
+MAX_ATR_PCT_HARD   = _get_float("MAX_ATR_PCT_HARD", 0.70)
+BLOCK_AGAINST_HTF  = _get_bool("BLOCK_AGAINST_HTF", True)
+BLOCK_TF_15M_LOW   = _get_bool("BLOCK_TF_15M_LOW", True)
+MIN_SCORE_15M      = _get_float("MIN_SCORE_15M", 65)
+
+# ============================================================
+# 🆕 حماية Rate Limit
+# ============================================================
+RATE_LIMIT_BACKOFF_BASE = _get_float("RATE_LIMIT_BACKOFF_BASE", 2.0)
+RATE_LIMIT_MAX_RETRIES  = _get_int("RATE_LIMIT_MAX_RETRIES", 3)
+SYMBOL_COOLDOWN_SEC     = _get_int("SYMBOL_COOLDOWN_SEC", 60)
+SYMBOL_DELAY_MS         = _get_int("SYMBOL_DELAY_MS", 200)
+GLOBAL_PAUSE_SEC        = _get_int("GLOBAL_PAUSE_SEC", 120)
+GLOBAL_PAUSE_TRIGGER    = _get_int("GLOBAL_PAUSE_TRIGGER", 3)
 
 # ============================================================
 # إعدادات تنبيهات السعر
@@ -169,11 +177,15 @@ log = logging.getLogger("cross")
 def init_exchange():
     options = {
         "enableRateLimit": True,
-        "timeout": 30000,
-        "options": {"defaultType": MARKET_TYPE},
+        "timeout": 60000,
+        "options": {
+            "defaultType": MARKET_TYPE,
+            "fetchOHLCV": {"maxLimit": 200},
+        },
     }
     if EXCHANGE_NAME == "bybit":
         options["options"]["unifiedMargin"] = False
+        options["rateLimit"] = 500  # 500ms بين الطلبات
 
     mapping = {
         "okx": ccxt.okx, "bybit": ccxt.bybit, "kucoin": ccxt.kucoin,
@@ -195,13 +207,19 @@ def init_exchange():
 
 _exchange = init_exchange()
 
-# كاشات
+# ============================================================
+# كاشات وحالات
+# ============================================================
 _crossover_cache: dict = {}
 _price_state: dict = {}
 _ohlcv_cache: dict = {}
 _hybrid_digest: list = []
 
-# 🆕 عدّادات إحصائية للفلتر
+# 🆕 حماية Rate Limit
+_symbol_cooldown: dict = {}
+_rate_limit_global_until: float = 0.0
+
+# 🆕 إحصائيات الفلتر
 _filter_stats = {
     "sent": 0,
     "hidden": 0,
@@ -211,6 +229,8 @@ _filter_stats = {
     "filtered_htf": 0,
     "filtered_15m_score": 0,
     "filtered_other": 0,
+    "rate_limit_hits": 0,
+    "global_pauses": 0,
 }
 
 
@@ -300,22 +320,82 @@ def fmt_price(value: float) -> str:
 
 
 # ============================================================
-# جلب الشموع + كاش
+# 🆕 جلب الشموع مع Retry + Backoff + Cooldown
 # ============================================================
 async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150):
+    global _rate_limit_global_until
     if _exchange is None:
         return None
-    try:
-        return await asyncio.to_thread(_exchange.fetch_ohlcv, symbol, timeframe, None, limit)
-    except ccxt.BadSymbol:
-        log.warning(f"⚠️ رمز غير مدعوم: {symbol}")
+
+    now = _time.time()
+
+    # ⛔ إيقاف عالمي
+    if now < _rate_limit_global_until:
+        remaining = int(_rate_limit_global_until - now)
+        log.debug(f"⏸️ إيقاف عالمي — باقي {remaining}ث")
         return None
-    except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-        log.warning(f"⚠️ {symbol} {timeframe}: {type(e).__name__}: {e}")
+
+    # ⛔ كولداون الرمز
+    cooldown_until = _symbol_cooldown.get(symbol, 0)
+    if now < cooldown_until:
+        remaining = int(cooldown_until - now)
+        log.debug(f"⏸️ {symbol} في كولداون — باقي {remaining}ث")
         return None
-    except Exception as e:
-        log.warning(f"❌ {symbol}: {type(e).__name__}: {e}")
-        return None
+
+    last_err = None
+    for attempt in range(RATE_LIMIT_MAX_RETRIES):
+        try:
+            data = await asyncio.to_thread(
+                _exchange.fetch_ohlcv, symbol, timeframe, None, limit
+            )
+            _symbol_cooldown.pop(symbol, None)
+            return data
+
+        except ccxt.RateLimitExceeded as e:
+            last_err = e
+            _filter_stats["rate_limit_hits"] += 1
+            wait = RATE_LIMIT_BACKOFF_BASE * (2 ** attempt)
+            log.warning(
+                f"⚠️ RateLimit {symbol} {timeframe} "
+                f"(محاولة {attempt+1}/{RATE_LIMIT_MAX_RETRIES}) — انتظار {wait}ث"
+            )
+            await asyncio.sleep(wait)
+
+            if attempt == RATE_LIMIT_MAX_RETRIES - 1:
+                _symbol_cooldown[symbol] = _time.time() + SYMBOL_COOLDOWN_SEC
+                log.warning(f"⏸️ {symbol} في كولداون {SYMBOL_COOLDOWN_SEC}ث")
+
+                active_cooldowns = sum(
+                    1 for ts in _symbol_cooldown.values() if ts > _time.time()
+                )
+                if active_cooldowns >= GLOBAL_PAUSE_TRIGGER:
+                    _rate_limit_global_until = _time.time() + GLOBAL_PAUSE_SEC
+                    _filter_stats["global_pauses"] += 1
+                    log.error(
+                        f"🚨 إيقاف عالمي {GLOBAL_PAUSE_SEC}ث — "
+                        f"Bybit يرفض الطلبات ({active_cooldowns} رموز)"
+                    )
+
+        except ccxt.BadSymbol:
+            log.warning(f"⚠️ رمز غير مدعوم: {symbol}")
+            _symbol_cooldown[symbol] = _time.time() + 3600
+            return None
+
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            last_err = e
+            wait = RATE_LIMIT_BACKOFF_BASE * (2 ** attempt)
+            log.warning(
+                f"⚠️ {symbol} {timeframe} {type(e).__name__}: {e} "
+                f"— انتظار {wait}ث (محاولة {attempt+1})"
+            )
+            await asyncio.sleep(wait)
+
+        except Exception as e:
+            log.warning(f"❌ {symbol}: {type(e).__name__}: {e}")
+            return None
+
+    log.error(f"❌ فشل {symbol} {timeframe} بعد {RATE_LIMIT_MAX_RETRIES} محاولات")
+    return None
 
 
 async def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int = 150):
@@ -324,6 +404,7 @@ async def fetch_ohlcv_cached(symbol: str, timeframe: str, limit: int = 150):
     cached = _ohlcv_cache.get(key)
     if cached and (now - cached["ts"]) < OHLCV_CACHE_SECONDS:
         return cached["data"]
+
     data = await fetch_ohlcv(symbol, timeframe, limit)
     if data:
         _ohlcv_cache[key] = {"data": data, "ts": now}
@@ -367,7 +448,6 @@ def classify_strength(timeframe: str, gap_pct: float) -> str:
 # المؤشرات الداعمة + العلامة (Score)
 # ============================================================
 def _score_volume(vol_ratio: float) -> tuple:
-    """Volume Score (0-30 نقطة)"""
     if vol_ratio >= 4.0:   return 30, "قوي جداً 🔥"
     if vol_ratio >= 2.5:   return 25, "قوي"
     if vol_ratio >= 1.5:   return 18, "جيد"
@@ -377,7 +457,6 @@ def _score_volume(vol_ratio: float) -> tuple:
 
 
 def _score_adx(adx: float) -> tuple:
-    """ADX Score (0-20 نقطة)"""
     if adx >= 50:  return 18, "اتجاه متطرف"
     if adx >= 35:  return 20, "اتجاه قوي جداً"
     if adx >= 25:  return 18, "اتجاه واضح"
@@ -387,7 +466,6 @@ def _score_adx(adx: float) -> tuple:
 
 
 def _score_gap(gap_pct: float) -> tuple:
-    """فرق EMA Score (0-15 نقطة)"""
     if gap_pct >= 0.60:  return 12, "كبير جداً"
     if gap_pct >= 0.30:  return 15, "كبير"
     if gap_pct >= 0.10:  return 10, "متوسط"
@@ -397,7 +475,6 @@ def _score_gap(gap_pct: float) -> tuple:
 
 
 def _score_macd(hist_now: float, hist_prev: float) -> tuple:
-    """MACD Score (0-10 نقطة)"""
     rising = hist_now > hist_prev
     if hist_now > 0 and rising:    return 10, "يتسارع صعوداً ↗"
     if hist_now > 0 and not rising: return 5, "يتباطأ صعوداً ↘"
@@ -406,7 +483,6 @@ def _score_macd(hist_now: float, hist_prev: float) -> tuple:
 
 
 def _score_rsi(rsi: float, direction: str) -> tuple:
-    """RSI Score (0-10 نقطة)"""
     if direction == "bullish":
         if 55 <= rsi <= 70:   return 10, "زخم صاعد صحي ⭐"
         if rsi > 70:          return 5,  "تشبع شرائي (قد ينعكس)"
@@ -422,7 +498,6 @@ def _score_rsi(rsi: float, direction: str) -> tuple:
 
 
 def _score_htf(price: float, ema50: float, direction: str) -> tuple:
-    """توافق EMA50 Score (0-10 نقطة)"""
     above = price > ema50
     if direction == "bullish" and above:  return 10, "مع الاتجاه الأكبر ✅"
     if direction == "bearish" and not above: return 10, "مع الاتجاه الأكبر ✅"
@@ -430,29 +505,16 @@ def _score_htf(price: float, ema50: float, direction: str) -> tuple:
 
 
 def _score_atr(atr_pct: float) -> tuple:
-    """ATR Score (0-5 نقطة)"""
     if atr_pct >= 0.30:  return 5, "نشاط جيد"
     if atr_pct >= 0.15:  return 3, "طبيعي"
     return 1, "خمول"
 
 
 def analyze_with_score(df: pd.DataFrame, direction: str, curr_idx: int = -2) -> dict:
-    """
-    حساب المؤشرات الداعمة + العلامة (0-100).
-    الأوزان:
-      Volume  : 30
-      ADX     : 20
-      Gap EMA : 15
-      MACD    : 10
-      RSI     : 10
-      EMA50   : 10
-      ATR     :  5
-    """
     close = df["c"]
     vol = df["v"]
     current_price = float(close.iloc[curr_idx])
 
-    # --- Volume ---
     try:
         start = max(0, len(df) + curr_idx - 20)
         end = len(df) + curr_idx
@@ -463,14 +525,12 @@ def analyze_with_score(df: pd.DataFrame, direction: str, curr_idx: int = -2) -> 
         vol_ratio = 0
     vol_pts, vol_label = _score_volume(vol_ratio)
 
-    # --- ADX ---
     try:
         adx = float(calc_adx(df).iloc[curr_idx])
     except Exception:
         adx = 0
     adx_pts, adx_label = _score_adx(adx)
 
-    # --- Gap ---
     try:
         ef = float(calc_ema(close, EMA_FAST).iloc[curr_idx])
         es = float(calc_ema(close, EMA_SLOW).iloc[curr_idx])
@@ -479,21 +539,18 @@ def analyze_with_score(df: pd.DataFrame, direction: str, curr_idx: int = -2) -> 
         gap_pct = 0
     gap_pts, gap_label = _score_gap(gap_pct)
 
-    # --- MACD ---
     try:
         _, _, hist = calc_macd(close)
         macd_pts, macd_label = _score_macd(float(hist.iloc[curr_idx]), float(hist.iloc[curr_idx - 1]))
     except Exception:
         macd_pts, macd_label = 0, "غير محدد"
 
-    # --- RSI ---
     try:
         rsi = float(calc_rsi(close).iloc[curr_idx])
     except Exception:
         rsi = 50
     rsi_pts, rsi_label = _score_rsi(rsi, direction)
 
-    # --- EMA50 ---
     try:
         ema50 = float(calc_ema(close, 50).iloc[curr_idx])
         htf_pts, htf_label = _score_htf(current_price, ema50, direction)
@@ -501,7 +558,6 @@ def analyze_with_score(df: pd.DataFrame, direction: str, curr_idx: int = -2) -> 
         ema50 = current_price
         htf_pts, htf_label = 0, "?"
 
-    # --- ATR ---
     try:
         atr = float(calc_atr(df).iloc[curr_idx])
         atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
@@ -509,10 +565,8 @@ def analyze_with_score(df: pd.DataFrame, direction: str, curr_idx: int = -2) -> 
         atr_pct = 0
     atr_pts, atr_label = _score_atr(atr_pct)
 
-    # --- المجموع ---
     total = vol_pts + adx_pts + gap_pts + macd_pts + rsi_pts + htf_pts + atr_pts
 
-    # --- التصنيف ---
     if total >= 80:
         grade = "🌟 ذهبية"
     elif total >= 65:
@@ -539,13 +593,9 @@ def analyze_with_score(df: pd.DataFrame, direction: str, curr_idx: int = -2) -> 
 
 
 # ============================================================
-# 🆕 فلتر الجودة الإلزامي
+# فلتر الجودة الإلزامي
 # ============================================================
 def passes_hard_filter(cross: dict) -> tuple:
-    """
-    فلتر إلزامي يطبَّق على كل الإشارات.
-    returns: (passed: bool, reason: str, category: str)
-    """
     if not ENABLE_HARD_FILTER:
         return True, "", ""
 
@@ -560,24 +610,19 @@ def passes_hard_filter(cross: dict) -> tuple:
     htf   = s.get("htf_pts", 0)
     score = s.get("score", 0)
 
-    # 1) الحجم ضعيف جداً
     if vol < MIN_VOL_RATIO:
         return False, f"الحجم ضعيف ({vol}× < {MIN_VOL_RATIO})", "vol"
 
-    # 2) ADX ضعيف جداً (سوق عرضي)
     if adx < MIN_ADX_HARD:
         return False, f"ADX منخفض ({adx} < {MIN_ADX_HARD})", "adx"
 
-    # 3) تقلب مرتفع جداً (ضوضاء)
     if atr > MAX_ATR_PCT_HARD:
         return False, f"ATR مرتفع ({atr}% > {MAX_ATR_PCT_HARD}%)", "atr"
 
-    # 4) ضد الاتجاه الأكبر (EMA50) — لا يطبق على "pre"
     if BLOCK_AGAINST_HTF and cross.get("alert_type") != "pre":
         if htf == 0:
             return False, "ضد الاتجاه الأكبر (EMA50)", "htf"
 
-    # 5) إشارات 15m تشترط علامة أعلى
     if BLOCK_TF_15M_LOW and tf == "15m" and score < MIN_SCORE_15M:
         return False, f"15m بعلامة منخفضة ({score} < {MIN_SCORE_15M})", "15m_score"
 
@@ -585,7 +630,7 @@ def passes_hard_filter(cross: dict) -> tuple:
 
 
 # ============================================================
-# 1) التقاطع المؤكد (شمعة مغلقة)
+# 1) التقاطع المؤكد
 # ============================================================
 async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
     if not ENABLE_CONFIRMED:
@@ -631,7 +676,7 @@ async def detect_crossover(symbol: str, timeframe: str) -> dict | None:
 
 
 # ============================================================
-# 2) التقاطع المبدئي (شمعة جارية)
+# 2) التقاطع المبدئي
 # ============================================================
 async def detect_live_crossover(symbol: str, timeframe: str) -> dict | None:
     if not ENABLE_LIVE_CROSS:
@@ -887,7 +932,6 @@ def build_message(cross: dict) -> str:
 
     candle_time = syria_from_ts(cross["candle_ts"])
 
-    # 🆕 ملاحظات الفلتر (في وضع silent فقط، للشفافية)
     filter_note = ""
     if s and SCORE_MODE == "silent" and ENABLE_HARD_FILTER:
         notes = []
@@ -1060,6 +1104,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• ATR أقصى: {MAX_ATR_PCT_HARD}%\n"
         f"• منع ضد EMA50: {'✅' if BLOCK_AGAINST_HTF else '❌'}\n"
         f"• عتبة 15m خاصة: {MIN_SCORE_15M}\n\n"
+        f"<b>🛡️ حماية Rate Limit:</b>\n"
+        f"• Retry: {RATE_LIMIT_MAX_RETRIES} | Backoff: {RATE_LIMIT_BACKOFF_BASE}×\n"
+        f"• كولداون الرمز: {SYMBOL_COOLDOWN_SEC}ث\n"
+        f"• إيقاف عالمي: {GLOBAL_PAUSE_SEC}ث (بعد {GLOBAL_PAUSE_TRIGGER} رموز)\n"
+        f"• كاش الشموع: {OHLCV_CACHE_SECONDS}ث\n"
+        f"• تأخير بين الطلبات: {SYMBOL_DELAY_MS}ms\n\n"
         f"<b>🔔 تنبيهات التغير:</b>\n"
         f"• الفحص: كل {PRICE_ALERT_INTERVAL_MIN} دقيقة\n"
         f"• الحد الأقصى: {MAX_PRICE_ALERTS}\n{thresholds_str}\n\n"
@@ -1071,6 +1121,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/cross5 /cross15 /cross1h — فريم واحد\n"
         f"/checkprice — فحص التغيرات\n"
         f"/report — التقرير الصباحي\n"
+        f"/clearcache — تفريغ الكاش والكولداون\n"
         f"/symbols /status",
         parse_mode="HTML",
     )
@@ -1101,8 +1152,7 @@ async def _run_cross(update, timeframes_filter: list[str] | None = None):
                 if not cross:
                     continue
 
-                # 🆕 تطبيق الفلتر الإلزامي
-                passed, reason, category = passes_hard_filter(cross)
+                passed, reason, _category = passes_hard_filter(cross)
                 if not passed:
                     filtered += 1
                     continue
@@ -1112,6 +1162,9 @@ async def _run_cross(update, timeframes_filter: list[str] | None = None):
                     found += 1
                 except Exception as e:
                     log.error(f"send {symbol} {tf}: {e}")
+
+            # 🆕 تأخير بين الأزواج لتقليل الضغط
+            await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
 
     msg = f"✅ تم إرسال {found} إشارة."
     if filtered:
@@ -1141,6 +1194,7 @@ async def cmd_checkprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 found += 1
             except Exception as e:
                 log.error(f"send {symbol}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if found == 0:
         await update.message.reply_text("⚪ لا توجد تغيرات مفاجئة تتجاوز العتبات حالياً.")
 
@@ -1160,6 +1214,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 analyses.append(a)
         except Exception as e:
             log.exception(f"report {symbol}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if not analyses:
         await update.message.reply_text("⚪ لا توجد بيانات كافية.")
         return
@@ -1182,6 +1237,21 @@ async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _rate_limit_global_until
+    _ohlcv_cache.clear()
+    _crossover_cache.clear()
+    _symbol_cooldown.clear()
+    _rate_limit_global_until = 0.0
+    await update.message.reply_text(
+        "✅ تم تفريغ:\n"
+        "• كاش الشموع\n"
+        "• كاش التقاطعات\n"
+        "• كولداون الرموز\n"
+        "• الإيقاف العالمي"
+    )
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source = _exchange.name if _exchange else "❌ فشل"
     states = []
@@ -1197,6 +1267,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + _filter_stats["filtered_htf"]
         + _filter_stats["filtered_15m_score"]
         + _filter_stats["filtered_other"]
+    )
+
+    # 🆕 حالة Rate Limit
+    now_ts = _time.time()
+    active_cd = {s: int(ts - now_ts) for s, ts in _symbol_cooldown.items() if ts > now_ts}
+    global_cd = int(_rate_limit_global_until - now_ts) if _rate_limit_global_until > now_ts else 0
+
+    rate_status = (
+        f"<b>🛡️ حماية Rate Limit:</b>\n"
+        f"• إيقاف عالمي: {'🚨 ' + str(global_cd) + 'ث' if global_cd > 0 else '⚪ لا'}\n"
+        f"• رموز في كولداون: {len(active_cd)}\n"
+    )
+    for sym, secs in list(active_cd.items())[:5]:
+        rate_status += f"   - {short(sym)}: {secs}ث\n"
+    rate_status += (
+        f"• مرات تجاوز الحد: {_filter_stats['rate_limit_hits']}\n"
+        f"• مرات الإيقاف العالمي: {_filter_stats['global_pauses']}\n\n"
     )
 
     await update.message.reply_text(
@@ -1224,6 +1311,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   - ضد EMA50: {_filter_stats['filtered_htf']}\n"
         f"   - 15m ضعيفة: {_filter_stats['filtered_15m_score']}\n"
         f"• في الملخص: {_filter_stats['hidden']}\n\n"
+        f"{rate_status}"
         f"<b>🔍 الكشف المبكر:</b>\n"
         f"• pre: {'✅' if ENABLE_PRE_CROSS else '❌'} | "
         f"live: {'✅' if ENABLE_LIVE_CROSS else '❌'} | "
@@ -1248,11 +1336,6 @@ async def error_handler(update, context):
 # Jobs
 # ============================================================
 def _should_send(cross: dict) -> tuple:
-    """
-    تحديد ما إذا كانت الإشارة تُرسَل فوراً + نوع الإرسال.
-    returns: (send_now: bool, send_to_digest: bool, reason: str)
-    """
-    # 🔒 الفلتر الإلزامي أولاً
     passed, reason, _category = passes_hard_filter(cross)
     if not passed:
         return False, False, reason
@@ -1336,9 +1419,7 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
                         log.debug(f"💤 محجوب: {symbol} [{tf}] Score={score}")
 
                     else:
-                        # محجوب بواسطة الفلتر الإلزامي
                         filtered += 1
-                        # تحديث الإحصائيات حسب السبب
                         if "الحجم" in reason:
                             _filter_stats["filtered_vol"] += 1
                         elif "ADX" in reason:
@@ -1355,6 +1436,9 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
 
                 except Exception as e:
                     log.exception(f"job {symbol} {tf}: {e}")
+
+            # 🆕 تأخير بين الأزواج
+            await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
 
     if total or hidden or filtered:
         log.info(
@@ -1396,6 +1480,7 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
                     log.error(f"send {symbol}: {e}")
         except Exception as e:
             log.exception(f"job price_alert {symbol}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if total:
         log.info(f"📤 {total} إشعار تغير مفاجئ")
 
@@ -1411,6 +1496,7 @@ async def morning_report_job(context: ContextTypes.DEFAULT_TYPE):
                 analyses.append(a)
         except Exception as e:
             log.exception(f"morning report {symbol}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if not analyses:
         return
     if CHAT_ID:
@@ -1459,6 +1545,9 @@ def main():
     print(f"🎯 SCORE_MODE={SCORE_MODE} | MIN_SCORE={MIN_SCORE} | GOLD_SCORE={GOLD_SCORE}")
     print(f"🔒 فلتر إلزامي: {'✅' if ENABLE_HARD_FILTER else '❌'} | "
           f"vol≥{MIN_VOL_RATIO}× adx≥{MIN_ADX_HARD} atr≤{MAX_ATR_PCT_HARD}%")
+    print(f"🛡️ Rate Limit: retry={RATE_LIMIT_MAX_RETRIES} "
+          f"backoff={RATE_LIMIT_BACKOFF_BASE}× cooldown={SYMBOL_COOLDOWN_SEC}ث "
+          f"cache={OHLCV_CACHE_SECONDS}ث delay={SYMBOL_DELAY_MS}ms")
     print(f"🔔 الكشف المبكر: pre={'✅' if ENABLE_PRE_CROSS else '❌'} "
           f"live={'✅' if ENABLE_LIVE_CROSS else '❌'} "
           f"confirmed={'✅' if ENABLE_CONFIRMED else '❌'}")
@@ -1474,6 +1563,7 @@ def main():
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("symbols", cmd_symbols))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     app.add_error_handler(error_handler)
 
     if app.job_queue:
